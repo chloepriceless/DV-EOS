@@ -512,17 +512,19 @@ class GeneticOptimization(OptimizationBase):
         self.verbose = verbose
         self.fix_seed = fixed_seed
         self.optimize_ev = True
-        # DVhub fork (2026-05-29): keep DC-charge optimization OFF (dc_charge=1
-        # on every slot) so PV surplus ALWAYS charges the battery from PV the
-        # moment it appears. Operator priority: the battery MUST be full by
-        # evening, charged from PV (AC-PV charging stays fully active — only the
-        # grid→battery AC path is blocked via inverter max_ac_charge_power_w=0).
-        # We briefly enabled this (=True) to let the GA hold SoC low and sell
-        # morning PV / charge only from the cheapest (negative) window, but that
-        # under-filled the battery (sold PV it should have stored) — fullness
-        # priority wins over cheapest-source optimization. Negative-price feed-in
-        # is still curtailed (no export at price<0); grid charging still blocked.
-        self.optimize_dc_charge = False
+        # DVhub fork (2026-05-29): DC-charge optimization ON. The GA gets a
+        # per-slot dc_allowed gene so it controls PV→battery charging timing:
+        # hold SoC low and SELL PV while feed-in prices are high (morning), then
+        # fill the battery from the cheapest (midday/negative) PV, reaching 100%
+        # for the evening peak. battery.charge_energy honours charge_array[hour]
+        # ==0 (surplus exports instead of charging). This now works correctly
+        # because (a) the active PV forecast is VRM (~112 kWh, realistic) not the
+        # under-predicting forecast_solar, and (b) the battery residual value
+        # (levelized_cost_of_storage_kwh → preis_euro_pro_wh_akku, set from
+        # userEnergyPricing.costs.batteryBaseCtKwh) now rewards ending full, so
+        # the GA targets 100% instead of selling everything cheap. Pairs with
+        # negative-price feed-in curtailment + grid-charge block.
+        self.optimize_dc_charge = True
         self.fitness_history: dict[str, Any] = {}
 
         # Set a fixed seed for random operations if provided or in debug mode
