@@ -355,6 +355,23 @@ class GeneticSimulation(PydanticBaseModel):
                     eigenverbrauch,
                 ) = inverter_fast.process_energy(energy_produced, consumption, hour)
 
+            # DVhub fork (2026-05-29): hard PV curtailment at negative feed-in
+            # price. When the feed-in tariff for this slot is < 0 the operator
+            # receives NO remuneration (no Marktprämie) for exported PV and may
+            # even pay — so exporting is a pure loss. Curtail the export instead:
+            # the surplus PV that the battery couldn't absorb is simply not fed in
+            # (counted as a loss/curtailment), never exported at a negative price.
+            # The optimizer then values these slots at revenue 0 (vs negative),
+            # so it stops planning loss-making negative-price feed-in. EOS is
+            # display-only, so the plan instructs zero export here and downstream
+            # automation curtails the PV. Operator rule: ANY price < 0 → no feed-in.
+            if (
+                energy_feedin_grid_actual > 0.0
+                and elect_revenue_per_hour_arr_fast[hour] < 0.0
+            ):
+                losses_wh_per_hour[hour_idx] += energy_feedin_grid_actual
+                energy_feedin_grid_actual = 0.0
+
             # AC PV Battery Charge
             if battery_fast:
                 hour_ac_charge = ac_charge_hours_fast[hour]
