@@ -430,6 +430,27 @@ class GeneticSimulation(PydanticBaseModel):
 class GeneticOptimization(OptimizationBase):
     """GENETIC algorithm to solve energy optimization."""
 
+    # DVhub fork helpers — single source of truth for slot math.
+    # At interval=3600s slot_duration_h=1.0 and total_slots==prediction.hours,
+    # so all legacy hourly call sites stay byte-identical. At interval=900s
+    # slot_duration_h=0.25 and total_slots==prediction.hours*4.
+    @property
+    def slot_duration_h(self) -> float:
+        interval = self.config.optimization.interval or 3600
+        return interval / 3600
+
+    @property
+    def slots_per_hour(self) -> int:
+        interval = self.config.optimization.interval or 3600
+        return 3600 // interval
+
+    @property
+    def total_slots(self) -> int:
+        # Read prediction.hours directly here — must not call self.total_slots
+        # (infinite recursion) and must stay outside the replace_all pattern.
+        cfg_pred = self.config.prediction
+        return int(cfg_pred.hours * self.slots_per_hour)
+
     def __init__(
         self,
         verbose: bool = False,
@@ -437,8 +458,11 @@ class GeneticOptimization(OptimizationBase):
     ):
         """Initialize the optimization problem with the required parameters."""
         self.opti_param: dict[str, Any] = {}
-        self.fixed_eauto_hours = (
-            self.config.prediction.hours - self.config.optimization.horizon_hours
+        # fixed_eauto_slots: number of slots at the tail of the optimization
+        # window where EV charging must be 0. Used to be `fixed_eauto_hours`
+        # — kept slot-counted here so 15-min runs reserve the right tail length.
+        self.fixed_eauto_hours = self.total_slots - (
+            self.config.optimization.horizon_hours * self.slots_per_hour
         )
         self.ev_possible_charge_values: list[float] = [1.0]
         # Separate charge-level list for battery AC charging (independent of EV rates).
@@ -515,23 +539,23 @@ class GeneticOptimization(OptimizationBase):
             total_states = 3 * len_bat
 
         # 1. Mutating the charge_discharge part
-        charge_discharge_part = individual[: self.config.prediction.hours]
+        charge_discharge_part = individual[: self.total_slots]
         (charge_discharge_mutated,) = self.toolbox.mutate_charge_discharge(charge_discharge_part)
 
         # Instead of a fixed clamping to 0..8 or 0..6 dynamically:
         charge_discharge_mutated = np.clip(charge_discharge_mutated, 0, total_states - 1)
-        individual[: self.config.prediction.hours] = charge_discharge_mutated
+        individual[: self.total_slots] = charge_discharge_mutated
 
         # 2. Mutating the EV charge part, if active
         if self.optimize_ev:
             ev_charge_part = individual[
-                self.config.prediction.hours : self.config.prediction.hours * 2
+                self.total_slots : self.total_slots * 2
             ]
             (ev_charge_part_mutated,) = self.toolbox.mutate_ev_charge_index(ev_charge_part)
-            ev_charge_part_mutated[self.config.prediction.hours - self.fixed_eauto_hours :] = [
+            ev_charge_part_mutated[self.total_slots - self.fixed_eauto_hours :] = [
                 0
             ] * self.fixed_eauto_hours
-            individual[self.config.prediction.hours : self.config.prediction.hours * 2] = (
+            individual[self.total_slots : self.total_slots * 2] = (
                 ev_charge_part_mutated
             )
 
@@ -547,13 +571,13 @@ class GeneticOptimization(OptimizationBase):
     def create_individual(self) -> list[int]:
         # Start with discharge states for the individual
         individual_components = [
-            self.toolbox.attr_discharge_state() for _ in range(self.config.prediction.hours)
+            self.toolbox.attr_discharge_state() for _ in range(self.total_slots)
         ]
 
         # Add EV charge index values if optimize_ev is True
         if self.optimize_ev:
             individual_components += [
-                self.toolbox.attr_ev_charge_index() for _ in range(self.config.prediction.hours)
+                self.toolbox.attr_ev_charge_index() for _ in range(self.total_slots)
             ]
 
         # Add the start time of the household appliance if it's being optimized
@@ -586,7 +610,7 @@ class GeneticOptimization(OptimizationBase):
             individual.extend(eautocharge_hours_index.tolist())
         elif self.optimize_ev:
             # Falls optimize_ev aktiv ist, aber keine EV-Daten vorhanden sind, fügen wir Nullen hinzu
-            individual.extend([0] * self.config.prediction.hours)
+            individual.extend([0] * self.total_slots)
 
         # Add dishwasher start time if applicable
         if self.opti_param.get("home_appliance", 0) > 0 and washingstart_int is not None:
@@ -608,13 +632,13 @@ class GeneticOptimization(OptimizationBase):
         3. Dishwasher start time (integer if applicable).
         """
         # Discharge hours as a NumPy array of ints
-        discharge_hours_bin = np.array(individual[: self.config.prediction.hours], dtype=int)
+        discharge_hours_bin = np.array(individual[: self.total_slots], dtype=int)
 
         # EV charge hours as a NumPy array of ints (if optimize_ev is True)
         eautocharge_hours_index = (
             # append ev charging states to individual
             np.array(
-                individual[self.config.prediction.hours : self.config.prediction.hours * 2],
+                individual[self.total_slots : self.total_slots * 2],
                 dtype=int,
             )
             if self.optimize_ev
@@ -720,7 +744,7 @@ class GeneticOptimization(OptimizationBase):
         if self.optimize_dc_charge:
             self.simulation.dc_charge_hours = dc_charge_hours
         else:
-            self.simulation.dc_charge_hours = np.full(self.config.prediction.hours, 1)
+            self.simulation.dc_charge_hours = np.full(self.total_slots, 1)
         self.simulation.ac_charge_hours = ac_charge_hours
 
         if eautocharge_hours_index is not None:
@@ -732,7 +756,7 @@ class GeneticOptimization(OptimizationBase):
             self.simulation.ev_charge_hours = eautocharge_hours_float
         else:
             # discharge is set to 0 by default
-            self.simulation.ev_charge_hours = np.full(self.config.prediction.hours, 0)
+            self.simulation.ev_charge_hours = np.full(self.total_slots, 0)
 
         # Do the simulation and return result.
         return self.simulation.simulate(self.ems.start_datetime.hour)
@@ -1083,27 +1107,30 @@ class GeneticOptimization(OptimizationBase):
                 logger.error("Generations not configured. Using {}.", generations)
 
         einspeiseverguetung_euro_pro_wh = np.full(
-            self.config.prediction.hours, parameters.ems.einspeiseverguetung_euro_pro_wh
+            self.total_slots, parameters.ems.einspeiseverguetung_euro_pro_wh
         )
 
         self.simulation.reset()
 
-        # Initialize PV and EV batteries
+        # Initialize PV and EV batteries — slot_duration_h scales power-caps
+        # (max_charge_power_w) to per-slot energy-caps inside Battery.
         akku: Optional[Battery] = None
         if parameters.pv_akku:
             akku = Battery(
                 parameters.pv_akku,
-                prediction_hours=self.config.prediction.hours,
+                prediction_hours=self.total_slots,
+                slot_duration_h=self.slot_duration_h,
             )
-            akku.set_charge_per_hour(np.full(self.config.prediction.hours, 0))
+            akku.set_charge_per_hour(np.full(self.total_slots, 0))
 
         eauto: Optional[Battery] = None
         if parameters.eauto:
             eauto = Battery(
                 parameters.eauto,
-                prediction_hours=self.config.prediction.hours,
+                prediction_hours=self.total_slots,
+                slot_duration_h=self.slot_duration_h,
             )
-            eauto.set_charge_per_hour(np.full(self.config.prediction.hours, 1))
+            eauto.set_charge_per_hour(np.full(self.total_slots, 1))
             self.optimize_ev = (
                 parameters.eauto.min_soc_percentage - parameters.eauto.initial_soc_percentage >= 0
             )
@@ -1156,30 +1183,38 @@ class GeneticOptimization(OptimizationBase):
             self.bat_possible_charge_values = [1.0]
         logger.debug("Battery AC charge levels: {}", self.bat_possible_charge_values)
 
-        # Initialize household appliance if applicable
+        # Initialize household appliance if applicable. slot_duration_h is a
+        # forward-compat hook — at 15-min slots full HomeAppliance support
+        # additionally requires converting start_hour→start_slot and
+        # duration_h→duration_slots inside HomeAppliance.set_starting_time().
+        # DV operators don't currently optimize dishwashers, so the math stays
+        # hourly-correct via default slot_duration_h=1.0 for production usage.
         dishwasher = (
             HomeAppliance(
                 parameters=parameters.dishwasher,
                 optimization_hours=self.config.optimization.horizon_hours,
-                prediction_hours=self.config.prediction.hours,
+                prediction_hours=self.total_slots,
+                slot_duration_h=self.slot_duration_h,
             )
             if parameters.dishwasher is not None
             else None
         )
 
-        # Initialize the inverter and energy management system
+        # Initialize the inverter and energy management system — slot_duration_h
+        # scales max_power_wh (treated as a per-slot energy cap) inside Inverter.
         inverter: Optional[Inverter] = None
         if parameters.inverter:
             inverter = Inverter(
                 parameters.inverter,
                 battery=akku,
+                slot_duration_h=self.slot_duration_h,
             )
 
         # Prepare device simulation
         self.simulation.prepare(
             parameters=parameters.ems,
             optimization_hours=self.config.optimization.horizon_hours,
-            prediction_hours=self.config.prediction.hours,
+            prediction_hours=self.total_slots,
             inverter=inverter,  # battery is part of inverter
             ev=eauto,
             home_appliance=dishwasher,

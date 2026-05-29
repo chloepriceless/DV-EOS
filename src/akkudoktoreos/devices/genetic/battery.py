@@ -12,9 +12,19 @@ from akkudoktoreos.optimization.genetic.geneticdevices import (
 class Battery:
     """Represents a battery device with methods to simulate energy charging and discharging."""
 
-    def __init__(self, parameters: BaseBatteryParameters, prediction_hours: int):
+    def __init__(
+        self,
+        parameters: BaseBatteryParameters,
+        prediction_hours: int,
+        slot_duration_h: float = 1.0,
+    ):
+        # DVhub fork: `prediction_hours` is misnamed — it is the number of
+        # optimization slots, not hours. At interval=3600 slot_duration_h=1.0
+        # and slot-count == hour-count, so legacy callers stay byte-identical.
+        # At interval=900 slot_duration_h=0.25 and the slot-count is 4x.
         self.parameters = parameters
         self.prediction_hours = prediction_hours
+        self.slot_duration_h = slot_duration_h
         self._setup()
 
     def _setup(self) -> None:
@@ -137,8 +147,9 @@ class Battery:
         # Raw extractable energy above minimum SoC
         raw_available_wh = max(self.soc_wh - self.min_soc_wh, 0.0)
 
-        # Maximum raw discharge due to power limit
-        max_raw_wh = self.max_charge_power_w  # TODO rename to max_discharge_power_w
+        # Maximum raw discharge due to power limit, scaled to slot duration.
+        # max_charge_power_w is power [W] — energy per slot is power × hours.
+        max_raw_wh = self.max_charge_power_w * self.slot_duration_h  # TODO rename to max_discharge_power_w
 
         # Actual raw withdrawal (internal)
         raw_withdrawal_wh = min(raw_available_wh, max_raw_wh)
@@ -229,7 +240,9 @@ class Battery:
 
         # Provide fast (3x..5x) local read access (vs. self.xxx) for repetitive read access
         soc_wh_fast = self.soc_wh
-        max_charge_power_w_fast = self.max_charge_power_w
+        # DVhub fork: scale power-cap to per-slot energy-cap (W × h = Wh).
+        # At slot_duration_h=1.0 (hourly) this is byte-identical to legacy.
+        max_charge_per_slot_wh_fast = self.max_charge_power_w * self.slot_duration_h
         charging_efficiency_fast = self.charging_efficiency
 
         # Decide mode & determine raw_request_wh and raw_charge_wh
@@ -237,13 +250,13 @@ class Battery:
             raw_request_wh = wh
             raw_charge_wh = max(self.max_soc_wh - soc_wh_fast, 0.0) / charging_efficiency_fast
         elif wh is None and charge_factor > 0.0:  # mode 2
-            raw_request_wh = max_charge_power_w_fast * charge_factor
+            raw_request_wh = max_charge_per_slot_wh_fast * charge_factor
             raw_charge_wh = max(self.max_soc_wh - soc_wh_fast, 0.0) / charging_efficiency_fast
             if raw_request_wh > raw_charge_wh:
                 # Use a lower charge factor
                 lower_charge_factors = self._lower_charge_rates_desc(charge_factor)
                 for charge_factor in lower_charge_factors:
-                    raw_request_wh = max_charge_power_w_fast * charge_factor
+                    raw_request_wh = max_charge_per_slot_wh_fast * charge_factor
                     if raw_request_wh <= raw_charge_wh:
                         self.charge_array[hour] = charge_factor
                         break
@@ -258,7 +271,7 @@ class Battery:
             )
 
         # Remaining capacity
-        max_raw_wh = min(raw_charge_wh, max_charge_power_w_fast)
+        max_raw_wh = min(raw_charge_wh, max_charge_per_slot_wh_fast)
 
         # Actual raw intake
         raw_input_wh = raw_request_wh if raw_request_wh < max_raw_wh else max_raw_wh

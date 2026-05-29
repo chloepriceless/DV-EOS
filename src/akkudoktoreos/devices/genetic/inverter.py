@@ -12,9 +12,14 @@ class Inverter:
         self,
         parameters: InverterParameters,
         battery: Optional[Battery] = None,
+        slot_duration_h: float = 1.0,
     ):
+        # DVhub fork: slot_duration_h scales the per-slot energy caps
+        # (max_power_wh, max_ac_charge_power_w). Defaults to 1.0 which keeps
+        # legacy hourly behaviour byte-identical.
         self.parameters: InverterParameters = parameters
         self.battery: Optional[Battery] = battery
+        self.slot_duration_h: float = slot_duration_h
         self._setup()
 
     def _setup(self) -> None:
@@ -23,11 +28,17 @@ class Inverter:
             logger.error(error_msg)
             raise ValueError(error_msg)
         self.self_consumption_predictor = get_eos_load_interpolator()
+        # DVhub fork: scale Wh-caps to actual slot length. Parameters are
+        # supplied as power [W] values that the legacy code treats as Wh-per-
+        # hour; at 15-min slots a slot can hold 1/4 of that.
         self.max_power_wh = (
-            self.parameters.max_power_wh
-        )  # Maximum power that the inverter can handle
+            self.parameters.max_power_wh * self.slot_duration_h
+        )  # Maximum energy the inverter can move in one optimization slot
         self.dc_to_ac_efficiency = self.parameters.dc_to_ac_efficiency
         self.ac_to_dc_efficiency = self.parameters.ac_to_dc_efficiency
+        # Note: max_ac_charge_power_w stays as Watts. It feeds a power-ratio
+        # cap computation in genetic.py:simulate() (max_dc_factor = …); the
+        # ratio is dimensionless and slot-agnostic.
         self.max_ac_charge_power_w = self.parameters.max_ac_charge_power_w
 
     def process_energy(

@@ -192,11 +192,14 @@ class GeneticOptimizationParameters(
             logger.info("Optimization horizon unknown - defaulting to 24 hours.")
             cls.config.optimization.horizon_hours = 24
         if cls.config.optimization.interval is None:
-            logger.info("Optimization interval unknown - defaulting to 3600 seconds.")
             cls.config.optimization.interval = 3600
-        if cls.config.optimization.interval != 3600:
-            logger.info(
-                "Optimization interval '{}' seconds not supported - forced to 3600 seconds."
+        # DVhub fork: allow 15-min slots. Slot-math at line ~230 is already
+        # interval-aware (power_to_energy_per_interval_factor = interval/3600).
+        ALLOWED_INTERVALS = (3600, 1800, 900)
+        if cls.config.optimization.interval not in ALLOWED_INTERVALS:
+            logger.warning(
+                f"Optimization interval {cls.config.optimization.interval}s "
+                f"not in {ALLOWED_INTERVALS} - forcing 3600."
             )
             cls.config.optimization.interval = 3600
         # Check genetic algorithm definitions
@@ -315,12 +318,18 @@ class GeneticOptimizationParameters(
                 # Retry
                 continue
             try:
-                loadforecast_power_w = cls.prediction.key_to_array(
-                    key="loadforecast_power_w",
-                    start_datetime=parameter_start_datetime,
-                    end_datetime=parameter_end_datetime,
-                    interval=interval,
-                    fill_method="ffill",
+                # DVhub fork: load is a power series [W]; downstream genetic
+                # consumes it as Wh-per-slot. Scale by interval/3600 so 15-min
+                # slots see correct per-slot consumption (1/4 of hourly Wh).
+                loadforecast_power_w = (
+                    cls.prediction.key_to_array(
+                        key="loadforecast_power_w",
+                        start_datetime=parameter_start_datetime,
+                        end_datetime=parameter_end_datetime,
+                        interval=interval,
+                        fill_method="ffill",
+                    )
+                    * power_to_energy_per_interval_factor
                 ).tolist()
             except:
                 logger.info(

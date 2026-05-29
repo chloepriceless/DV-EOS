@@ -37,6 +37,7 @@ from akkudoktoreos.prediction.elecpricefixed import ElecPriceFixed
 from akkudoktoreos.prediction.elecpriceimport import ElecPriceImport
 from akkudoktoreos.prediction.feedintarifffixed import FeedInTariffFixed
 from akkudoktoreos.prediction.feedintariffimport import FeedInTariffImport
+from akkudoktoreos.prediction.feedintariffenergycharts import FeedInTariffEnergyCharts
 from akkudoktoreos.prediction.loadakkudoktor import (
     LoadAkkudoktor,
     LoadAkkudoktorAdjusted,
@@ -78,6 +79,7 @@ elecprice_fixed = ElecPriceFixed()
 elecprice_import = ElecPriceImport()
 feedintariff_fixed = FeedInTariffFixed()
 feedintariff_import = FeedInTariffImport()
+feedintariff_energycharts = FeedInTariffEnergyCharts()
 loadforecast_akkudoktor = LoadAkkudoktor()
 loadforecast_akkudoktor_adjusted = LoadAkkudoktorAdjusted()
 loadforecast_vrm = LoadVrm()
@@ -99,6 +101,7 @@ def prediction_providers() -> list[
         ElecPriceImport,
         FeedInTariffFixed,
         FeedInTariffImport,
+        FeedInTariffEnergyCharts,
         LoadAkkudoktor,
         LoadAkkudoktorAdjusted,
         LoadVrm,
@@ -123,6 +126,7 @@ def prediction_providers() -> list[
         elecprice_import, \
         feedintariff_fixed, \
         feedintariff_import, \
+        feedintariff_energycharts, \
         loadforecast_akkudoktor, \
         loadforecast_akkudoktor_adjusted, \
         loadforecast_vrm, \
@@ -143,6 +147,7 @@ def prediction_providers() -> list[
         elecprice_import,
         feedintariff_fixed,
         feedintariff_import,
+        feedintariff_energycharts,
         loadforecast_akkudoktor,
         loadforecast_akkudoktor_adjusted,
         loadforecast_vrm,

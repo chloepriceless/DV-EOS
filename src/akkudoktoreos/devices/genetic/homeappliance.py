@@ -11,9 +11,14 @@ class HomeAppliance:
         parameters: HomeApplianceParameters,
         optimization_hours: int,
         prediction_hours: int,
+        slot_duration_h: float = 1.0,
     ):
+        # DVhub fork: at slot_duration_h=1.0 (hourly) this is byte-identical.
+        # At 0.25 (15-min) the load_curve is indexed in slots, duration_h is
+        # converted to a slot count, and per-slot Wh = power_w × slot_duration_h.
         self.parameters: HomeApplianceParameters = parameters
         self.prediction_hours = prediction_hours
+        self.slot_duration_h = slot_duration_h
         self._setup()
 
     def _setup(self) -> None:
