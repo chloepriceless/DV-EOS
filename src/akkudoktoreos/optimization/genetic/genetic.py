@@ -512,17 +512,17 @@ class GeneticOptimization(OptimizationBase):
         self.verbose = verbose
         self.fix_seed = fixed_seed
         self.optimize_ev = True
-        # DVhub fork (2026-05-29): enable DC-charge optimization so the genetic
-        # algorithm controls PV→battery charging per slot (dc_allowed gene).
-        # Upstream default False forces dc_charge=1 everywhere, so PV surplus
-        # ALWAYS charges the battery the moment it appears — the optimizer could
-        # never hold SoC low while feed-in prices are still positive. With this
-        # on, the GA can defer charging: sell PV at positive prices in the
-        # morning and fill the battery from the cheapest (negative/low-price)
-        # PV window, while still reaching full for the evening peak. Pairs with
-        # the negative-price feed-in curtailment above. Larger search space —
-        # acceptable at gens=400/pop=300 for the 192-slot horizon.
-        self.optimize_dc_charge = True
+        # DVhub fork (2026-05-29): keep DC-charge optimization OFF (dc_charge=1
+        # on every slot) so PV surplus ALWAYS charges the battery from PV the
+        # moment it appears. Operator priority: the battery MUST be full by
+        # evening, charged from PV (AC-PV charging stays fully active — only the
+        # grid→battery AC path is blocked via inverter max_ac_charge_power_w=0).
+        # We briefly enabled this (=True) to let the GA hold SoC low and sell
+        # morning PV / charge only from the cheapest (negative) window, but that
+        # under-filled the battery (sold PV it should have stored) — fullness
+        # priority wins over cheapest-source optimization. Negative-price feed-in
+        # is still curtailed (no export at price<0); grid charging still blocked.
+        self.optimize_dc_charge = False
         self.fitness_history: dict[str, Any] = {}
 
         # Set a fixed seed for random operations if provided or in debug mode
