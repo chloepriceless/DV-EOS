@@ -451,6 +451,30 @@ class GeneticOptimization(OptimizationBase):
         cfg_pred = self.config.prediction
         return int(cfg_pred.hours * self.slots_per_hour)
 
+    def _start_day_slot(self) -> int:
+        """Slot index (from local midnight) of ems.start_datetime.
+
+        simulate()/evaluate() use the simulation's *start position* as a SLOT
+        index into the prediction/charge arrays (length == total_slots, slot 0
+        == 00:00 local), NOT as an hour-of-day. The legacy code passed the bare
+        hour (`start_datetime.hour`), which at 15-min resolution pointed 12
+        slots (=3 h) too early — the simulation result was then de-offset by
+        geneticsolution.py using start_day_slot, producing a 3 h shift between
+        the dispatch and its time/PV/price labels.
+
+        This MUST mirror geneticsolution.py's start_day_slot exactly (same tz
+        conversion + formula) so the serializer de-offsets the result with the
+        identical index. At interval=3600s slots_per_hour==1 and minute==0, so
+        it reduces to start_datetime.hour — byte-identical to legacy hourly. """
+        sd = self.ems.start_datetime
+        try:
+            sd = sd.in_timezone(self.config.general.timezone)
+        except Exception:
+            pass
+        sph = self.slots_per_hour
+        slot_minutes = max(1, 60 // sph)
+        return sd.hour * sph + sd.minute // slot_minutes
+
     def __init__(
         self,
         verbose: bool = False,
@@ -758,8 +782,11 @@ class GeneticOptimization(OptimizationBase):
             # discharge is set to 0 by default
             self.simulation.ev_charge_hours = np.full(self.total_slots, 0)
 
-        # Do the simulation and return result.
-        return self.simulation.simulate(self.ems.start_datetime.hour)
+        # Do the simulation and return result. simulate()'s argument is a SLOT
+        # index into the prediction/charge arrays, not an hour-of-day — pass the
+        # start_day_slot so 15-min runs don't dispatch 3 h too early (the bare
+        # hour was the cause of the SoC/grid-flow time shift). DVhub fork.
+        return self.simulation.simulate(self._start_day_slot())
 
     def evaluate(
         self,
@@ -1096,6 +1123,11 @@ class GeneticOptimization(OptimizationBase):
             raise ValueError(
                 f"Start hour not synced. EMS {self.ems.start_datetime.hour} vs. GENETIC {start_hour}."
             )
+        # start_hour stays the hour-of-day for the DEAP appliance-start gene
+        # bounds (attr_int/mutate_hour, 0..23). For everything that indexes the
+        # slot arrays (simulate result offset, evaluate's AC break-even loop) use
+        # the slot index so 15-min runs stay aligned with geneticsolution.py.
+        start_slot = self._start_day_slot()
 
         # Set the number of generations
         generations = ngen
@@ -1220,11 +1252,13 @@ class GeneticOptimization(OptimizationBase):
             home_appliance=dishwasher,
         )
 
-        # Setup the DEAP environment and optimization process
+        # Setup the DEAP environment and optimization process. setup_deap gets
+        # the hour-of-day (appliance gene bounds); evaluate gets the slot index
+        # (its AC break-even loop walks the slot arrays from "now").
         self.setup_deap_environment({"home_appliance": 1 if dishwasher else 0}, start_hour)
         self.toolbox.register(
             "evaluate",
-            lambda ind: self.evaluate(ind, parameters, start_hour, worst_case),
+            lambda ind: self.evaluate(ind, parameters, start_slot, worst_case),
         )
 
         start_time = time.time()
