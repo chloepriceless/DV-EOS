@@ -1,5 +1,6 @@
 """Genetic algorithm."""
 
+import os
 import random
 import time
 from typing import Any, Optional
@@ -23,6 +24,53 @@ from akkudoktoreos.optimization.genetic.geneticsolution import (
     GeneticSolution,
 )
 from akkudoktoreos.optimization.optimizationabc import OptimizationBase
+
+# DVhub fork (2026-05-29): overnight self-consumption reserve for the
+# battery→grid arbitrage discharge (Option B). Without it the optimizer empties
+# the battery into the evening price peak and buys the whole night's load back
+# from the grid. With it, grid-export discharge must leave enough charge to
+# cover the forecast net load (load − PV) until PV next covers load the next
+# morning. Self-consumption (covering load) is NOT limited — it consumes the
+# reserve through the night, ending near the floor as morning PV takes over.
+# EOS_OVERNIGHT_RESERVE=0 (then restart eos) disables it → sell to the floor.
+# EOS_OVERNIGHT_RESERVE_MARGIN pads the forecast against under-prediction.
+_OVERNIGHT_RESERVE_ENABLED = os.environ.get("EOS_OVERNIGHT_RESERVE", "1") not in (
+    "0",
+    "false",
+    "False",
+    "no",
+)
+try:
+    _OVERNIGHT_RESERVE_MARGIN = float(os.environ.get("EOS_OVERNIGHT_RESERVE_MARGIN", "1.1"))
+except (TypeError, ValueError):
+    _OVERNIGHT_RESERVE_MARGIN = 1.1
+
+
+def _compute_overnight_reserve(
+    load_array: np.ndarray,
+    pv_array: np.ndarray,
+    start_hour: int,
+    end_hour: int,
+    margin: float,
+) -> np.ndarray:
+    """Per-slot delivered-AC energy the battery must keep for self-consumption.
+
+    reserve[h] = margin × Σ max(load[j] − pv[j], 0) for j running from h+1 up to
+    (but not including) the next slot where PV covers load. Walked backwards so
+    each evening reserves exactly the energy needed to ride to the next morning.
+    """
+    reserve = np.zeros_like(load_array, dtype=float)
+    if not _OVERNIGHT_RESERVE_ENABLED:
+        return reserve
+    running = 0.0
+    for h in range(end_hour - 1, start_hour - 1, -1):
+        nxt = h + 1
+        if nxt >= end_hour or pv_array[nxt] >= load_array[nxt]:
+            running = 0.0  # morning reached (or horizon end) — no reserve beyond
+        else:
+            running += max(float(load_array[nxt]) - float(pv_array[nxt]), 0.0)
+        reserve[h] = running * margin
+    return reserve
 
 
 class GeneticSimulation(PydanticBaseModel):
@@ -311,6 +359,16 @@ class GeneticSimulation(PydanticBaseModel):
             # Default return if no home appliance is available
             home_appliance_wh_per_hour = np.full((total_hours), 0)
 
+        # DVhub fork: overnight self-consumption reserve for battery→grid export.
+        # Indexed by absolute slot like the load/PV arrays.
+        overnight_reserve_fast = _compute_overnight_reserve(
+            load_energy_array_fast,
+            pv_prediction_wh_fast,
+            start_hour,
+            end_hour,
+            _OVERNIGHT_RESERVE_MARGIN,
+        )
+
         for hour in range(start_hour, end_hour):
             hour_idx = hour - start_hour
 
@@ -353,7 +411,12 @@ class GeneticSimulation(PydanticBaseModel):
                     energy_consumption_grid_actual,
                     losses,
                     eigenverbrauch,
-                ) = inverter_fast.process_energy(energy_produced, consumption, hour)
+                ) = inverter_fast.process_energy(
+                    energy_produced,
+                    consumption,
+                    hour,
+                    export_reserve_ac_wh=float(overnight_reserve_fast[hour]),
+                )
 
             # DVhub fork (2026-05-29): hard PV curtailment at negative feed-in
             # price. When the feed-in tariff for this slot is < 0 the operator
@@ -638,6 +701,147 @@ class GeneticOptimization(OptimizationBase):
             individual_components += [self.toolbox.attr_int()]
 
         return creator.Individual(individual_components)
+
+    def _greedy_discharge_seed(self) -> Optional[list[int]]:
+        """DVhub fork (2026-06-01): build a SoC-aware warm-start individual.
+
+        Replaces the earlier global-top-N price seed (which also read battery /
+        forecast off ``self`` instead of ``self.simulation`` and therefore
+        silently no-op'd). Rather than blindly marking the N globally-highest
+        feed-in slots for discharge — ignoring whether the battery actually HAS
+        that energy at those slots, and tending to dump the evening en bloc —
+        this walks the forecast FORWARD to find the pack's charge episodes (PV
+        surplus filling it), then sells each episode's *reachable* surplus into
+        the best-priced slots within the window before the next recharge, while
+        keeping the overnight self-consumption reserve intact.
+
+        This plants the GA at a per-cycle cherry-picking basin that single-gene
+        mutation cannot reach from the contiguous-evening-dump local optimum
+        (verified gens 400 ≈ 1500). On days with a wide morning↔evening spread
+        and no dominant later peak it captures the 5–8 % spread on the shiftable
+        surplus kWh — real gain. On the current profile (dominant day+2 peak +
+        ~26.9 ct night self-consumption) the spread is largely consumed by the
+        reserve, so it does not hurt the headline. The GA refines from here, and
+        the simulate() SoC floors make any over-marking safe. Never throws;
+        returns None to skip cleanly.
+        """
+        try:
+            sim = self.simulation
+            bat = getattr(sim, "battery", None)
+            n = self.total_slots
+            if bat is None or n <= 0:
+                return None
+            len_bat = len(self.bat_possible_charge_values)
+            if len_bat <= 0:
+                return None
+            discharge_state = len_bat  # any value in [len_bat, 2*len_bat) decodes to discharge=1
+            dc_state = (3 * len_bat + 1) if self.optimize_dc_charge else 0
+
+            load = np.asarray(sim.load_energy_array, dtype=float)
+            pv = np.asarray(sim.pv_prediction_wh, dtype=float)
+            revenue = np.asarray(sim.elect_revenue_per_hour_arr, dtype=float)
+            if load.shape[0] < n or pv.shape[0] < n or revenue.shape[0] < n:
+                return None
+            load, pv, revenue = load[:n], pv[:n], revenue[:n]
+
+            start_slot = max(0, min(self._start_day_slot(), n))
+            slot_h = self.slot_duration_h
+            charge_eff = max(float(bat.charging_efficiency), 1e-6)
+            disch_eff = max(float(bat.discharging_efficiency), 1e-6)
+            min_soc_wh = float(bat.min_soc_wh)
+            max_soc_wh = float(bat.max_soc_wh)
+            soc_wh = float(bat.soc_wh)
+            # Per-slot raw DC energy the converter can move (charge or discharge).
+            raw_cap_wh = float(bat.max_charge_power_w) * slot_h
+            if raw_cap_wh <= 0:
+                return None
+            # Delivered-AC energy cap per slot when selling to grid.
+            sell_cap_wh = raw_cap_wh * disch_eff
+
+            # Default: allow PV (DC) charging in every slot so the pack fills.
+            genes: list[int] = [dc_state] * n
+
+            # Overnight self-consumption reserve (delivered-AC Wh) to keep at
+            # each slot — reuse the same helper the simulator's reserve gate
+            # uses, so seed and constraint agree on what "spare" means.
+            reserve = _compute_overnight_reserve(
+                load, pv, start_slot, n, _OVERNIGHT_RESERVE_MARGIN
+            )
+
+            # Forward self-consumption-only SoC trajectory + charge-episode flags.
+            # PV surplus charges (DC), deficit self-consumes from the pack. No
+            # arbitrage selling here — this is the baseline against which spare
+            # energy is measured.
+            soc_traj = np.zeros(n, dtype=float)
+            charging = np.zeros(n, dtype=bool)
+            for h in range(start_slot, n):
+                net = float(pv[h]) - float(load[h])
+                if net >= 0.0:  # PV surplus → DC charge
+                    headroom = max(max_soc_wh - soc_wh, 0.0)
+                    stored = min(net * charge_eff, headroom, raw_cap_wh * charge_eff)
+                    if stored > 1.0:
+                        soc_wh += stored
+                        charging[h] = True
+                else:  # deficit → self-consume from the pack
+                    deliverable = min((soc_wh - min_soc_wh) * disch_eff, sell_cap_wh)
+                    delivered = min(-net, max(deliverable, 0.0))
+                    soc_wh -= delivered / disch_eff
+                soc_traj[h] = soc_wh
+
+            # Segment the horizon into charge runs → (peak_slot, window_end)
+            # episodes. window_end is the next run's START (= next refill), so
+            # each sell window holds only the post-peak discharge-down phase that
+            # reserve[peak] is computed against. A leading anchor episode at the
+            # current SoC lets an evening start (already charged, no further PV)
+            # still sell down to reserve into tonight's best slots.
+            runs: list[tuple[int, int]] = []  # (run_start, run_peak=last charging slot)
+            run_start = None
+            for h in range(start_slot, n):
+                if charging[h]:
+                    if run_start is None:
+                        run_start = h
+                elif run_start is not None:
+                    runs.append((run_start, h - 1))
+                    run_start = None
+            if run_start is not None:
+                runs.append((run_start, n - 1))
+
+            episodes: list[tuple[int, int]] = []  # (peak_slot, window_end)
+            episodes.append((start_slot, runs[0][0] if runs else n))
+            for i, (_rs, rp) in enumerate(runs):
+                win_end = runs[i + 1][0] if i + 1 < len(runs) else n
+                episodes.append((rp, win_end))
+
+            picked_any = False
+            for peak, win_end in episodes:
+                if win_end <= peak:
+                    continue
+                peak_deliverable = max((soc_traj[peak] - min_soc_wh) * disch_eff, 0.0)
+                sellable = peak_deliverable - float(reserve[peak])
+                if sellable <= 1.0:
+                    continue
+                # Best feed-in slots in this episode's window, price-descending.
+                cand = [h for h in range(peak, win_end) if revenue[h] > 0.0]
+                cand.sort(key=lambda h: revenue[h], reverse=True)
+                for h in cand:
+                    if sellable <= 1.0:
+                        break
+                    genes[h] = discharge_state
+                    sellable -= sell_cap_wh
+                    picked_any = True
+
+            if not picked_any:
+                return None
+
+            # Pad EV + appliance gene segments to match create_individual()'s layout.
+            if self.optimize_ev:
+                genes += [0] * n
+            if self.opti_param.get("home_appliance", 0) > 0:
+                genes += [0]
+            return genes
+        except Exception as e:  # never break the optimization over a seeding hiccup
+            logger.debug("greedy discharge seed skipped: {}", e)
+            return None
 
     def merge_individual(
         self,
@@ -1104,6 +1308,18 @@ class GeneticOptimization(OptimizationBase):
         if start_solution is not None:
             for _ in range(10):
                 population.insert(0, creator.Individual(start_solution))
+
+        # DVhub fork (2026-06-01): SoC-aware greedy warm-start. Seeds the GA at a
+        # per-cycle cherry-picking solution — each PV charge episode's spare
+        # energy (above the overnight reserve) sold into its best reachable
+        # feed-in slots before the next recharge — so it escapes the contiguous-
+        # evening-dump local optimum that mutation alone can't leave. A few
+        # copies, like the start solution, so eaMuPlusLambda's selection keeps it
+        # iff it actually scores.
+        greedy_seed = self._greedy_discharge_seed()
+        if greedy_seed is not None:
+            for _ in range(10):
+                population.insert(0, creator.Individual(greedy_seed))
 
         # Run the evolutionary algorithm
         pop, log = algorithms.eaMuPlusLambda(
