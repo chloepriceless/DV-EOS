@@ -14,7 +14,7 @@ from pydantic import ConfigDict, Field
 from akkudoktoreos.core.pydantic import PydanticBaseModel
 from akkudoktoreos.devices.genetic.battery import Battery
 from akkudoktoreos.devices.genetic.homeappliance import HomeAppliance
-from akkudoktoreos.devices.genetic.inverter import Inverter
+from akkudoktoreos.devices.genetic.inverter import Inverter, _BATTERY_GRID_EXPORT_ENABLED
 from akkudoktoreos.optimization.genetic.geneticparams import (
     GeneticEnergyManagementParameters,
     GeneticOptimizationParameters,
@@ -1316,7 +1316,16 @@ class GeneticOptimization(OptimizationBase):
         # evening-dump local optimum that mutation alone can't leave. A few
         # copies, like the start solution, so eaMuPlusLambda's selection keeps it
         # iff it actually scores.
-        greedy_seed = self._greedy_discharge_seed()
+        # DVhub fork (2026-06-13): the warm-start plans battery→grid sales, so it
+        # is DV-export logic and is gated behind the export flag for consistency —
+        # with EOS_BATTERY_GRID_EXPORT off the simulator cannot sell, so seeding a
+        # sell-plan is pointless. NOTE: this gate is DEFENSIVE only; it is NOT what
+        # was breaking byte-identity — eaMuPlusLambda's selection discards the seed
+        # when it can't score, so gating it leaves test_geneticsimulation unchanged.
+        # The real gates-off drift was the load-coverage regression in inverter.py
+        # Case 2 (see the comment there); this just keeps all DV logic uniformly
+        # behind the same flag.
+        greedy_seed = self._greedy_discharge_seed() if _BATTERY_GRID_EXPORT_ENABLED else None
         if greedy_seed is not None:
             for _ in range(10):
                 population.insert(0, creator.Individual(greedy_seed))

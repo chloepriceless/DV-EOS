@@ -233,11 +233,21 @@ class Inverter:
                 # power cap (max_charge_power_w × slot_duration_h) and SoC floor
                 # across both roles; `available_ac_power` caps total inverter
                 # throughput — so the two never compound past either limit.
-                grid_export_allowed = (
-                    _BATTERY_GRID_EXPORT_ENABLED
-                    and self.battery.discharge_array[hour] > 0
-                )
-                cover_load = _SELF_CONSUMPTION_PRIORITY or grid_export_allowed
+                gene_allows_discharge = self.battery.discharge_array[hour] > 0
+                grid_export_allowed = _BATTERY_GRID_EXPORT_ENABLED and gene_allows_discharge
+                # Cover the house load from the battery when EITHER the genetic's
+                # discharge gene permits it (this is the vanilla v0.3.0 behaviour —
+                # discharge_energy's own gate keyed on discharge_array) OR
+                # _SELF_CONSUMPTION_PRIORITY forces it regardless of the gene.
+                # DVhub fork (2026-06-13): the gene term was previously folded into
+                # grid_export_allowed, so with EOS_BATTERY_GRID_EXPORT off (and no
+                # self-consumption priority) the battery stopped covering the load
+                # entirely — a regression vs vanilla, NOT a revert. That silently
+                # broke "all gates off ⇒ byte-identical to upstream" (the
+                # documented Option-A fallback). Keying load coverage on the gene
+                # restores vanilla when all DV gates are off, leaves the default-on
+                # behaviour unchanged, and keeps export still gated on the export flag.
+                cover_load = _SELF_CONSUMPTION_PRIORITY or gene_allows_discharge
                 # Load coverage may always draw down to the hard floor.
                 load_ac = min(shortfall, available_ac_power) if cover_load else 0.0
                 if grid_export_allowed:
