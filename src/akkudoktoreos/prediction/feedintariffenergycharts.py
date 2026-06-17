@@ -12,8 +12,8 @@ factor, and writes the result to feed_in_tariff_wh. No second HTTP fetch —
 zero extra load on energy-charts.info — runtime-dep on ElecPriceEnergyCharts
 being a configured (or co-running) provider.
 
-DVhub fork addition 2026-05-24 — see eos-patches/README.md for the apply
-flow and the upstream reasoning.
+DVhub fork addition 2026-05-24 — see LOGIC-CHANGES-DV.md for the list of fork
+divergences and the upstream reasoning.
 """
 from typing import Optional
 

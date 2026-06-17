@@ -36,8 +36,8 @@ DV-EOS implements it cleanly in `process_energy` Case 2 (a single
 headroom), with a forecast-derived **overnight reserve** (`genetic.py`
 `_compute_overnight_reserve`) that keeps enough charge to self-consume the night,
 and a **self-consumption priority** that covers load from the battery before any
-grid import. See `eos-patches/UPSTREAM-battery-grid-export.md` (carried into this
-repo) for the upstream-PR write-up.
+grid import. See `UPSTREAM-battery-grid-export.md` (in this repo) for the
+upstream-PR write-up.
 
 ## Activation today (env) → config tomorrow (upstream)
 
@@ -58,8 +58,10 @@ gates off the math is byte-identical to upstream.
 
 ## Patch inventory
 
-See `eos-patches/` in the DVhub repo (`apply.sh`) for the canonical, idempotent
-patch set this fork was assembled from. Files touched:
+This fork is **applied directly** to the source tree (the patches live as fork
+commits on top of Akkudoktor-EOS v0.3.0, not as a separate `eos-patches/` apply
+set). See `LOGIC-CHANGES-DV.md` for the annotated list of divergences and
+`git log` for the commits. Files touched:
 `optimization/genetic/{genetic,geneticparams}.py`,
 `devices/genetic/{inverter,battery,homeappliance}.py`,
 `prediction/{feedintariff,prediction,feedintariffenergycharts}.py`,
