@@ -4,6 +4,34 @@ All notable changes to the akkudoktoreos project will be documented in this file
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [DV-EOS fork] - unreleased
+
+DV-EOS is a fork of Akkudoktor-EOS **v0.3.0** maintained by Bikini Bottom Capital
+(Christin von Perbandt) for Direktvermarktung use. See `LOGIC-CHANGES-DV.md` for
+the annotated divergences. Fork changes on top of v0.3.0:
+
+### Added
+- Battery→grid arbitrage discharge (`EOS_BATTERY_GRID_EXPORT`): the inverter may
+  sell stored energy to the grid in Case 2 (PV < load) and additively co-export
+  in Case 1 (PV ≥ load), gated by the discharge gene and overnight reserve.
+- Forecast-derived overnight reserve (`_compute_overnight_reserve`,
+  `EOS_OVERNIGHT_RESERVE`/`_MARGIN`): keeps enough charge to self-consume the
+  coming night before exporting.
+- Self-consumption priority (`EOS_SELF_CONSUMPTION_PRIORITY`): covers house load
+  from the battery before any grid import, price-independent.
+- Hard negative-price PV curtailment in `genetic.py`: at feed-in price < 0 the
+  export is curtailed (revenue 0) instead of sold at a loss.
+- `FeedInTariffEnergyCharts` provider: mirrors the ElecPriceEnergyCharts spot
+  series × operator factor into `feed_in_tariff_wh` (no second HTTP fetch).
+- 15-minute optimization slots: per-slot energy caps scale by `slot_duration_h`.
+- SoC-aware greedy discharge seed for the genetic optimizer.
+
+### Notes
+- All feature gates are environment variables (reversible). With every gate off,
+  the math is byte-identical to upstream v0.3.0 (guarded by
+  `tests/test_byte_identity.py`).
+- EOS runs display-only behind DVhub; the plan is consumed by DVhub automation.
+
 ## 0.3.0 (2026-03-17)
 
 Akkudoktor-EOS can now be run as Home Assistant add-on and standalone.

@@ -2,6 +2,14 @@ Energie Optimierungs System
 
 Copyright (c) 2024 Dr. Andreas Schmitz, c/o Grosch Postflex #1662, Emsdettener Str. 10, 48268 Greven
 
+DERIVATIVE WORK / FORK NOTICE (Apache-2.0 §4):
+DV-EOS is a modified version of Akkudoktor-EOS, forked from upstream release
+v0.3.0. Modifications copyright (c) 2026 Bikini Bottom Capital (Christin von
+Perbandt). Changed files carry in-source markers ("DVhub fork …"). The original
+Akkudoktor-EOS copyright above is retained unchanged. The fork divergences are
+documented in LOGIC-CHANGES-DV.md and CHANGELOG.md; the upstream battery→grid
+write-up is in UPSTREAM-battery-grid-export.md.
+
 This product includes software developed under the Apache License, Version 2.0.
 
 The source code of this product is publicly available and is distributed under the Apache License, Version 2.0, which allows users to use, modify, and redistribute it under the terms of the License.
