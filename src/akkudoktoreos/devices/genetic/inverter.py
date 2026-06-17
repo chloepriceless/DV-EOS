@@ -117,6 +117,12 @@ class Inverter:
                 # Remaining load Self Consumption not perfect
                 remaining_load_evq = (generation - consumption) * (1.0 - scr)
 
+                # DVhub fork (release-review #3): track raw Wh already withdrawn
+                # from the battery THIS slot, so the Case-1 co-export below can
+                # respect the remaining per-slot discharge power budget instead
+                # of starting a fresh uncapped discharge.
+                battery_raw_discharged_wh = 0.0
+
                 if remaining_load_evq > 0:
                     # Akku muss den Restverbrauch decken
                     if self.battery:
@@ -125,6 +131,11 @@ class Inverter:
                         from_battery_dc, discharge_losses = self.battery.discharge_energy(
                             dc_request, hour
                         )
+                        # Raw Wh pulled from the pack for self-consumption (the
+                        # delivered DC re-grossed by the discharge efficiency).
+                        disch_eff_load = self.battery.discharging_efficiency
+                        if disch_eff_load > 0:
+                            battery_raw_discharged_wh += from_battery_dc / disch_eff_load
                         # Convert DC output to AC
                         from_battery_ac = from_battery_dc * dc_to_ac_eff
                         inverter_discharge_losses = from_battery_dc - from_battery_ac
@@ -197,7 +208,18 @@ class Inverter:
                         0.0,
                     )
                     ac_unreserved = raw_unreserved_wh * disch_eff * dc_to_ac_eff
-                    export_ac = min(ac_unreserved, headroom_ac)
+                    # DVhub fork (release-review #3): cap the co-export to the
+                    # battery's REMAINING per-slot discharge power budget. The
+                    # per-slot cap (max_charge_power_w × slot_duration_h) is
+                    # enforced independently inside each discharge_energy() call,
+                    # so without this a slot that already discharged for self-
+                    # consumption could draw up to 2× the power limit. SoC chaining
+                    # is already correct (the self-consumption call decremented
+                    # soc_wh, reflected in raw_unreserved_wh above).
+                    max_raw_slot_wh = self.battery.max_charge_power_w * self.battery.slot_duration_h
+                    remaining_raw_wh = max(max_raw_slot_wh - battery_raw_discharged_wh, 0.0)
+                    export_ac_power_cap = remaining_raw_wh * disch_eff * dc_to_ac_eff
+                    export_ac = min(ac_unreserved, headroom_ac, export_ac_power_cap)
                     if export_ac > 0:
                         dc_request = export_ac / dc_to_ac_eff
                         exp_dc, exp_losses = self.battery.discharge_energy(dc_request, hour)

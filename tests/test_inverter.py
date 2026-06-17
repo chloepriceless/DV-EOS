@@ -2,6 +2,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from akkudoktoreos.devices.genetic.battery import Battery, SolarPanelBatteryParameters
 from akkudoktoreos.devices.genetic.inverter import Inverter, InverterParameters
 
 
@@ -18,6 +19,10 @@ def mock_battery() -> Mock:
     # numeric behaviour (the regression net) — the unit-level analogue of
     # test_byte_identity. 48 entries cover hourly and 15-min slot indices.
     mock_battery.discharge_array = [0] * 48
+    # The inverter re-grosses the delivered DC by the discharge efficiency to
+    # track the per-slot discharge power budget; a real Battery always exposes
+    # this. 1.0 keeps the existing numeric assertions unchanged.
+    mock_battery.discharging_efficiency = 1.0
     return mock_battery
 
 
@@ -345,3 +350,72 @@ def test_process_energy_zero_generation_full_battery_high_consumption(inverter, 
     mock_battery.charge_energy.assert_not_called()
     mock_battery.discharge_energy.assert_called_once_with(500.0, hour, ignore_gate=True)
     inverter.self_consumption_predictor.calculate_self_consumption.assert_not_called()
+
+
+def test_case1_coexport_respects_battery_discharge_power_cap():
+    """DVhub fork (release-review #3): a Case-1 slot that discharges the battery
+    for BOTH the self-consumption residual load (process_energy `:125`) and
+    battery->grid co-export (`:203`) must not exceed the battery's per-slot
+    discharge power cap (max_charge_power_w x slot_duration_h). The cap is
+    enforced independently inside each discharge_energy() call, so before the
+    fix two calls could draw up to 2x the limit in one slot.
+
+    Uses a REAL Battery (not a mock) so discharge_energy's internal power cap is
+    actually exercised.
+    """
+    params = SolarPanelBatteryParameters(
+        device_id="battery1",
+        capacity_wh=10000,
+        initial_soc_percentage=80,   # 8000 Wh available, SoC will NOT be the binding limit
+        charging_efficiency=1.0,
+        discharging_efficiency=1.0,  # clean arithmetic: raw == delivered
+        min_soc_percentage=0,
+        max_soc_percentage=100,
+        max_charge_power_w=1000.0,   # => 1000 Wh per 1h slot discharge power cap
+        hours=48,
+    )
+    battery = Battery(params, prediction_hours=48, slot_duration_h=1.0)
+    battery.reset()
+    hour = 12
+    battery.discharge_array[hour] = 1  # discharge gene on -> co-export branch active
+
+    # Record raw Wh withdrawn across ALL discharge_energy calls in this slot.
+    real_discharge = battery.discharge_energy
+    raw_withdrawals: list[float] = []
+
+    def recording_discharge(wh, h, ignore_gate=False):
+        delivered, losses = real_discharge(wh, h, ignore_gate=ignore_gate)
+        raw_withdrawals.append(delivered / battery.discharging_efficiency)
+        return delivered, losses
+
+    battery.discharge_energy = recording_discharge
+
+    # scr=0.7 -> with surplus 2000: residual-load discharge 600 Wh (`:125`,
+    # under the 1000 cap) AND co-export wants the rest of the (huge) SoC. Before
+    # the fix the co-export would draw a further full 1000 Wh -> 1600 total.
+    mock_pred = Mock()
+    mock_pred.calculate_self_consumption.return_value = 0.7
+    with patch(
+        "akkudoktoreos.devices.genetic.inverter.get_eos_load_interpolator",
+        return_value=mock_pred,
+    ):
+        iv = Inverter(
+            InverterParameters(
+                device_id="iv1", max_power_wh=100000.0, battery_id="battery1"
+            ),
+            battery=battery,
+            slot_duration_h=1.0,
+        )
+    iv.process_energy(generation=3000.0, consumption=1000.0, hour=hour)
+
+    max_raw_slot_wh = battery.max_charge_power_w * battery.slot_duration_h  # 1000.0
+    total_raw = sum(raw_withdrawals)
+    # Non-vacuous: BOTH discharge paths must have fired (else the cap is trivial).
+    assert len(raw_withdrawals) == 2, (
+        f"expected both self-consumption and co-export discharges, got "
+        f"{len(raw_withdrawals)} calls: {raw_withdrawals}"
+    )
+    assert total_raw <= max_raw_slot_wh + 1e-6, (
+        f"battery discharged {total_raw} Wh raw in one slot, exceeding the "
+        f"{max_raw_slot_wh} Wh per-slot power cap (release-review #3 regression)"
+    )
