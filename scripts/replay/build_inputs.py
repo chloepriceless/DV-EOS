@@ -109,8 +109,11 @@ def build_day(series, day: str, *, import_variant: str) -> dict:
             "initial_soc_percentage": initial_soc,
             "min_soc_percentage": 10,  # prod live = 10 (5% Victron blackout + ~5% EOS)
             "max_soc_percentage": 100,
-            "charging_efficiency": 0.9591663046625439,   # prod RT ~0.92 (0.959^2)
-            "discharging_efficiency": 0.9591663046625439,
+            # RT 0.85 = source-of-truth DVhub optimizer.roundTripEfficiency (0.922/dir).
+            # Live EOS shows 0.9592/dir (RT 0.92) but that is STALE/out-of-sync with
+            # the DVhub config (Voeltchen verified); use the source value.
+            "charging_efficiency": 0.9219544457292887,   # sqrt(0.85)
+            "discharging_efficiency": 0.9219544457292887,
             "max_charge_power_w": 18000,
             # NOTE: prod levelized_cost_of_storage_kwh=0.024 is NOT settable on the
             # input battery model -> omitted. Effect ~-0.05 EUR (extra cycled ~2 kWh
