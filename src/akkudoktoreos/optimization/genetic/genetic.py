@@ -75,12 +75,31 @@ try:
     )
 except (TypeError, ValueError):
     _RESERVE_RELEASE_SPREAD = 0.00005
+# Load-adaptive self-consumption safety floor (delivered-AC Wh) that is NEVER
+# released. Sized to THIS night's own forecast net-load so a load-heavy (winter)
+# night keeps more and a light night less, then clamped to a hard floor and a
+# moderate cap: safety = clamp(full_night_reserve × fraction, floor, cap). The
+# floor is the operator's blackout buffer and sits ON TOP of the battery min_soc
+# (the inverter subtracts the reserve in ADDITION to min_soc_wh, so the effective
+# export floor is min_soc + reserve). ~2 kWh floor = a typical/light night.
 try:
-    # Hard self-consumption safety floor (delivered-AC Wh) that is NEVER released,
-    # so a forecast miss cannot strand the house at min_soc overnight. ~2 kWh.
-    _RESERVE_MIN_SAFETY_WH = float(os.environ.get("EOS_RESERVE_MIN_SAFETY_WH", "2000"))
+    _RESERVE_SAFETY_FRACTION = float(
+        os.environ.get("EOS_RESERVE_SAFETY_FRACTION", "0.5")
+    )
 except (TypeError, ValueError):
-    _RESERVE_MIN_SAFETY_WH = 2000.0
+    _RESERVE_SAFETY_FRACTION = 0.5
+try:
+    _RESERVE_MIN_SAFETY_FLOOR_WH = float(
+        os.environ.get("EOS_RESERVE_MIN_SAFETY_FLOOR_WH", "2000")
+    )
+except (TypeError, ValueError):
+    _RESERVE_MIN_SAFETY_FLOOR_WH = 2000.0
+try:
+    _RESERVE_MIN_SAFETY_CAP_WH = float(
+        os.environ.get("EOS_RESERVE_MIN_SAFETY_CAP_WH", "6000")
+    )
+except (TypeError, ValueError):
+    _RESERVE_MIN_SAFETY_CAP_WH = 6000.0
 
 
 def _compute_overnight_reserve(
@@ -153,9 +172,15 @@ def _compute_overnight_reserve(
             else 0.0
         )
         if best_export - avoided_import > _RESERVE_RELEASE_SPREAD:
-            # Selling into the peak beats holding -> release to the safety floor
-            # (never reserve MORE than the energy-balance would have asked for).
-            reserve[h] = min(full_reserve, _RESERVE_MIN_SAFETY_WH)
+            # Selling into the peak beats holding -> release to the LOAD-ADAPTIVE
+            # safety floor: a fraction of this night's own net-load, clamped to a
+            # hard floor (blackout buffer, on top of min_soc) and a moderate cap.
+            # Never reserve MORE than the energy balance would have asked for.
+            safety = min(
+                max(full_reserve * _RESERVE_SAFETY_FRACTION, _RESERVE_MIN_SAFETY_FLOOR_WH),
+                _RESERVE_MIN_SAFETY_CAP_WH,
+            )
+            reserve[h] = min(full_reserve, safety)
         else:
             reserve[h] = full_reserve
     return reserve

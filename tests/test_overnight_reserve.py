@@ -118,12 +118,15 @@ class TestPriceAwareReserveRelease:
 
     @pytest.fixture(autouse=True)
     def _price_aware_on(self, monkeypatch):
-        # Gate ON + deterministic thresholds so the safety floor is visibly below
-        # the energy-balance reserve in these scenarios.
+        # Gate ON + deterministic thresholds. fraction=0 pins the safety floor to a
+        # constant 500 Wh for the scenario tests below (the load-adaptive sizing is
+        # exercised separately in test_safety_floor_is_load_adaptive).
         monkeypatch.setattr(genetic_mod, "_OVERNIGHT_RESERVE_ENABLED", True)
         monkeypatch.setattr(genetic_mod, "_RESERVE_PRICE_AWARE_ENABLED", True)
         monkeypatch.setattr(genetic_mod, "_RESERVE_RELEASE_SPREAD", 0.00005)  # 5 ct/kWh
-        monkeypatch.setattr(genetic_mod, "_RESERVE_MIN_SAFETY_WH", 500.0)
+        monkeypatch.setattr(genetic_mod, "_RESERVE_SAFETY_FRACTION", 0.0)
+        monkeypatch.setattr(genetic_mod, "_RESERVE_MIN_SAFETY_FLOOR_WH", 500.0)
+        monkeypatch.setattr(genetic_mod, "_RESERVE_MIN_SAFETY_CAP_WH", 1_000_000.0)
 
     # Shared scenario: 3 slots, 1 kWh load each, no PV (pure night).
     LOAD = np.array([1000.0, 1000.0, 1000.0])
@@ -211,3 +214,31 @@ class TestPriceAwareReserveRelease:
         # re-buy 40 ct -> not worth selling before that night).
         assert reserve[2] == 2000.0
         assert reserve[3] == 1000.0
+
+    def test_safety_floor_is_load_adaptive(self, monkeypatch):
+        """The never-released safety floor scales with the night's own net-load:
+        a load-heavy night keeps more reserve than a light one (operator request),
+        clamped to a hard floor (blackout buffer) and a moderate cap."""
+        monkeypatch.setattr(genetic_mod, "_RESERVE_SAFETY_FRACTION", 0.5)
+        monkeypatch.setattr(genetic_mod, "_RESERVE_MIN_SAFETY_FLOOR_WH", 1000.0)
+        monkeypatch.setattr(genetic_mod, "_RESERVE_MIN_SAFETY_CAP_WH", 6000.0)
+        pv = np.array([0.0, 0.0, 0.0])
+        price = np.array([0.0001, 0.0001, 0.0001])
+        revenue = np.array([0.0009, 0.0009, 0.0009])  # huge peak -> release every slot
+        heavy = _compute_overnight_reserve(
+            np.array([3000.0, 3000.0, 3000.0]), pv, 0, 3, 1.0, price, revenue
+        )
+        light = _compute_overnight_reserve(
+            np.array([1000.0, 1000.0, 1000.0]), pv, 0, 3, 1.0, price, revenue
+        )
+        veryheavy = _compute_overnight_reserve(
+            np.array([6000.0, 6000.0, 6000.0]), pv, 0, 3, 1.0, price, revenue
+        )
+        # heavy night full[0]=6000 -> safety = clamp(0.5*6000=3000, 1000, 6000)=3000.
+        assert heavy[0] == 3000.0
+        # light night full[0]=2000 -> safety = clamp(0.5*2000=1000, 1000, 6000)=1000 (floor).
+        assert light[0] == 1000.0
+        # very heavy full[0]=12000 -> safety = clamp(6000, 1000, 6000)=6000 (cap).
+        assert veryheavy[0] == 6000.0
+        # load-heavy night keeps strictly more reserve than the light one.
+        assert heavy[0] > light[0]
