@@ -61,6 +61,19 @@ def mock_battery() -> Mock:
     mock_bat.charge_energy = Mock(return_value=(0.0, 0.0))
     mock_bat.discharge_energy = Mock(return_value=(0.0, 0.0))
     mock_bat.parameters.device_id = "battery1"
+    # DVhub fork: process_energy reads battery.discharge_array[hour] (the discharge
+    # gene) to gate battery->grid co-export in BOTH cases (inverter.py:198/:258). The
+    # upstream-style mock only stubs charge/discharge methods, so the subscript dies
+    # with "Mock object is not subscriptable". An all-zero discharge_array keeps the
+    # co-export/export branches inert (gene_allows_discharge=False), so these tests
+    # exercise the vanilla self-consumption discharge path; load coverage still fires
+    # via _SELF_CONSUMPTION_PRIORITY (default-on). Mirrors the test_inverter.py fix.
+    mock_bat.discharge_array = [0] * 48
+    # Numeric discharging_efficiency: the Case-1 self-consumption path re-grosses
+    # the delivered DC by it for per-slot power-budget tracking (inverter.py:137).
+    # Only feeds the co-export cap (inert here via discharge_array=0), so the value
+    # is immaterial to these assertions — it just must not be a bare Mock.
+    mock_bat.discharging_efficiency = 1.0
     return mock_bat
 
 
@@ -141,9 +154,11 @@ class TestDcToAcEfficiency:
         # Battery was asked for more DC to compensate for inverter loss
         # ac_needed = min(200, max_power_wh - 0) = 200
         # dc_request = 200 / 0.95 ≈ 210.526
+        # DVhub fork: Case-2 discharge always passes ignore_gate=cover_load; with
+        # _SELF_CONSUMPTION_PRIORITY on (default) cover_load=True for load coverage.
         expected_dc_request = 200.0 / 0.95
         mock_battery.discharge_energy.assert_called_once_with(
-            pytest.approx(expected_dc_request, rel=1e-3), hour
+            pytest.approx(expected_dc_request, rel=1e-3), hour, ignore_gate=True
         )
 
     def test_discharge_with_100_percent_efficiency_unchanged(self, mock_battery):
@@ -205,6 +220,25 @@ class TestAcChargingInSimulation:
     These tests use a real Battery object (not a mock) and directly exercise
     the AC charging path in GeneticSimulation.simulate().
     """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_ac_charge_from_self_consumption(self, monkeypatch):
+        """Disable _SELF_CONSUMPTION_PRIORITY for the AC-charge mechanics tests.
+
+        These tests set bat_discharge_hours=0 and expect the house load to be
+        served from the grid, then assert how much AC energy the AC-charge path
+        draws. The DV fork's _SELF_CONSUMPTION_PRIORITY (default-on) covers the
+        load from the battery regardless of the discharge gene, which mixes
+        battery self-consumption into the measured grid draw and masks the
+        AC-charge math (every scenario came out exactly one load-slot too low).
+        SCP-off is a valid config state (the Option-A fallback); turning it off
+        here isolates the AC-charge feature under test. The SCPxAC-charge
+        interaction is an orthogonal concern, not these unit tests' subject.
+        """
+        monkeypatch.setattr(
+            "akkudoktoreos.devices.genetic.inverter._SELF_CONSUMPTION_PRIORITY",
+            False,
+        )
 
     @pytest.fixture
     def simulation_setup(self, config_eos):
@@ -447,6 +481,45 @@ class TestAcChargingInSimulation:
         assert result_test["Gesamtkosten_Euro"] > result_ref["Gesamtkosten_Euro"]
         # And total losses should be HIGHER
         assert result_test["Gesamt_Verluste"] > result_ref["Gesamt_Verluste"]
+
+    def test_self_consumption_priority_covers_load_during_ac_charge(
+        self, simulation_setup, monkeypatch
+    ):
+        """Characterize the DEFAULT-ON prod path (SCP) — counterpart to the
+        SCP-off mechanics tests in this class.
+
+        The autouse fixture disables _SELF_CONSUMPTION_PRIORITY to isolate the
+        AC-charge maths. Re-enable it here (its shipped default) to pin down what
+        actually runs in production: with SCP on, the battery covers the house
+        load from its own charge — even while the SAME slot AC-charges from the
+        grid, and even though the discharge gene is off (bat_discharge_hours=0).
+        So the measured grid draw in the AC-charge hour is the AC charge ALONE
+        (the load no longer appears in it), and the plain load hour before it
+        draws zero grid. This documents the same-slot round-trip (SCP discharge
+        for the load + AC-charge into the battery) that the optimizer pays for
+        via losses/fitness — left untested when the class isolates SCP out.
+        """
+        monkeypatch.setattr(
+            "akkudoktoreos.devices.genetic.inverter._SELF_CONSUMPTION_PRIORITY",
+            True,
+        )
+        sim, akku, inverter = simulation_setup(ac_to_dc_efficiency=1.0)
+        sim.ac_charge_hours[1] = 0.5
+        sim.dc_charge_hours[:] = 0
+        sim.bat_discharge_hours[:] = 0  # gene off — SCP still forces load coverage
+
+        result = sim.simulate(start_hour=0)
+
+        # Hour 0: the 1000 Wh load is served from the battery (SCP), not the grid.
+        assert result["Netzbezug_Wh_pro_Stunde"][0] == pytest.approx(0.0, abs=1e-6)
+        # Hour 1: grid draw is the AC charge ALONE (2500 Wh DC at unity efficiency);
+        # the 1000 Wh load is covered from the battery. Contrast the SCP-off
+        # backward-compat test, which sees 3500 Wh (load + AC charge) for the
+        # identical setup — that delta of one load-slot IS the SCP effect.
+        assert result["Netzbezug_Wh_pro_Stunde"][1] == pytest.approx(2500.0, rel=1e-3)
+        # Same-slot round-trip cost: 250 Wh battery-charge loss (2500 * (1-0.90))
+        # + ~111 Wh discharge loss for the SCP load coverage (1000/0.90 - 1000).
+        assert result["Verluste_Pro_Stunde"][1] == pytest.approx(361.11, rel=1e-2)
 
 
 # ===================================================================
