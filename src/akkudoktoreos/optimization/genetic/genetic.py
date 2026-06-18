@@ -119,26 +119,38 @@ def _compute_overnight_reserve(
         and revenue_array is not None
     )
     running = 0.0
+    # Exclusive upper bound of the night window the current reserve belongs to.
+    # The reserve at slot h is self-consumed over [h+1 .. night_window_end) before
+    # the next-morning PV refills the pack, so the price-aware release decision is
+    # scoped to THAT window only — comparing against prices beyond it (a later,
+    # possibly pricier night the energy never reaches) would wrongly suppress or
+    # trigger the release on a multi-day horizon (EOS runs 48h+).
+    night_window_end = end_hour
     for h in range(end_hour - 1, start_hour - 1, -1):
         nxt = h + 1
         if nxt >= end_hour or pv_array[nxt] >= load_array[nxt]:
             running = 0.0  # morning reached (or horizon end) — no reserve beyond
+            night_window_end = nxt  # a fresh night window starts above this boundary
         else:
             running += max(float(load_array[nxt]) - float(pv_array[nxt]), 0.0)
         full_reserve = running * margin
-        if not price_aware:
+        if not price_aware or full_reserve <= 0.0:
             reserve[h] = full_reserve
             continue
-        # Highest avoided night-import price the reserved energy would displace
-        # (this slot's night, ahead). Conservative: the most expensive night slot,
-        # so the reserve only releases when the peak clearly beats it.
+        # Highest avoided night-import price the reserved energy would displace,
+        # within this night window. Conservative: the most expensive slot, so the
+        # reserve only releases when the reachable export peak clearly beats it.
         avoided_import = (
-            float(np.max(price_array[nxt:end_hour])) if nxt < end_hour else 0.0
+            float(np.max(price_array[nxt:night_window_end]))
+            if nxt < night_window_end
+            else 0.0
         )
-        # Best export revenue still reachable from this slot forward — the peak we
-        # would forgo by holding the reserve.
+        # Best export revenue reachable from this slot before the window's morning
+        # — the peak we would forgo by holding the reserve for self-consumption.
         best_export = (
-            float(np.max(revenue_array[h:end_hour])) if h < end_hour else 0.0
+            float(np.max(revenue_array[h:night_window_end]))
+            if h < night_window_end
+            else 0.0
         )
         if best_export - avoided_import > _RESERVE_RELEASE_SPREAD:
             # Selling into the peak beats holding -> release to the safety floor

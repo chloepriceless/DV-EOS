@@ -190,3 +190,24 @@ class TestPriceAwareReserveRelease:
         a = _compute_overnight_reserve(self.LOAD, self.PV, 0, 3, 1.0, price, revenue)
         b = _compute_overnight_reserve(self.LOAD, self.PV, 0, 3, 1.0, price, revenue)
         assert np.array_equal(a, b)
+
+    def test_multi_day_horizon_scopes_release_to_its_own_night(self):
+        """The release decision is scoped to a slot's OWN night window, not the
+        whole 48h+ horizon. A later, pricier night must not suppress tonight's
+        release (the windowing bug a naive max-to-end would hit, found by R22
+        refute — every other test here is single-night and would miss it)."""
+        # Two nights; PV covers load only at slot 2 (the morning between them).
+        load = np.array([1000.0, 1000.0, 1000.0, 1000.0, 1000.0])
+        pv = np.array([0.0, 0.0, 2000.0, 0.0, 0.0])
+        # Night 1 (slot 1) cheap re-buy 10 ct; night 2 (slots 3-4) expensive 40 ct.
+        price = np.array([0.0001, 0.0001, 0.0001, 0.0004, 0.0004])
+        # Evening-1 export peak 30 ct at slot 0.
+        revenue = np.array([0.0003, 0.0001, 0.0001, 0.0001, 0.0001])
+        reserve = _compute_overnight_reserve(load, pv, 0, 5, 1.0, price, revenue)
+        # Slot 0: evening peak 30 ct > night-1 re-buy 10 ct -> RELEASE to the floor.
+        # A max-to-horizon window would compare against night-2's 40 ct and wrongly hold.
+        assert reserve[0] == 500.0
+        # Slot 2: holds full for the EXPENSIVE night 2 (reachable export 10 ct <
+        # re-buy 40 ct -> not worth selling before that night).
+        assert reserve[2] == 2000.0
+        assert reserve[3] == 1000.0
