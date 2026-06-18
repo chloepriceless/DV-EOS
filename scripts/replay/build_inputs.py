@@ -6,9 +6,9 @@ load / battery SoC, Berlin wall-clock hours) and writes one
 ``GeneticOptimizationParameters`` JSON per (day, import-price-variant) for
 ``scripts/replay/ablate.py`` to run gate-OFF vs gate-ON on.
 
-Faithfulness to Christin's prod setup (192.168.20.66, dvhub-fork):
-  - 43 kWh battery, min_soc 5 %, round-trip 0.85 (charge/discharge 0.922 each),
-    max charge 18 kW; inverter 24 kW with ac_to_dc_efficiency=0 → NO grid
+Faithfulness to Christin's prod setup (live-verified /v1/config 2026-06-19):
+  - 43 kWh battery, min_soc 10 %, round-trip ~0.92 (charge/discharge 0.959 each),
+    max charge 18 kW; inverter 29.7 kW with max_ac_charge_power_w=0 → NO grid
     charging (prod allowGridCharge=false: the battery only ever charges from PV).
   - Feed-in = spot price ×1 (prod tariff.feedInMode=spot), per-hour array.
   - Import price: two variants — "fix" = flat 26.9 ct/kWh gross (Christin's fixed
@@ -102,22 +102,27 @@ def build_day(series, day: str, *, import_variant: str) -> dict:
             "pv_prognose_wh": [round(x, 2) for x in pv_w],
             "strompreis_euro_pro_wh": strompreis,
         },
+        # Exact prod EOS device config (live-verified from /v1/config, 2026-06-19).
         "pv_akku": {
             "device_id": "battery1",
             "capacity_wh": 43000,
             "initial_soc_percentage": initial_soc,
-            "min_soc_percentage": 5,
+            "min_soc_percentage": 10,  # prod live = 10 (5% Victron blackout + ~5% EOS)
             "max_soc_percentage": 100,
-            "charging_efficiency": 0.922,
-            "discharging_efficiency": 0.922,
+            "charging_efficiency": 0.9591663046625439,   # prod RT ~0.92 (0.959^2)
+            "discharging_efficiency": 0.9591663046625439,
             "max_charge_power_w": 18000,
+            # NOTE: prod levelized_cost_of_storage_kwh=0.024 is NOT settable on the
+            # input battery model -> omitted. Effect ~-0.05 EUR (extra cycled ~2 kWh
+            # x 2.4 ct wear), i.e. the reported delta is a tiny overestimate.
         },
         "inverter": {
             "device_id": "inverter1",
-            "max_power_wh": 24000,
+            "max_power_wh": 29700,  # prod max_power_w=29700
             "battery_id": "battery1",
-            "ac_to_dc_efficiency": 0.0,  # prod allowGridCharge=false → no grid charging
+            "ac_to_dc_efficiency": 1.0,
             "dc_to_ac_efficiency": 1.0,
+            "max_ac_charge_power_w": 0.0,  # prod: no grid charging (allowGridCharge=false)
         },
         "eauto": {
             "device_id": "ev1",
