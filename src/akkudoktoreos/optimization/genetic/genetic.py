@@ -1049,19 +1049,12 @@ class GeneticOptimization(OptimizationBase):
             traj_used, charging_used = soc_traj, charging
 
             if _PV_CHARGE_WINDOW_ENABLED and self.optimize_dc_charge:
-                # Fill budget sized to the self-consumption peak the baseline
-                # trajectory reaches (NOT max_soc_wh) — composes with the Finding-2
-                # reserve: store fills headroom, the sell side drains spare above
-                # reserve, disjoint bands, no over-store the reserve then dumps.
-                target_soc_wh = float(np.max(soc_traj[start_slot:n])) if start_slot < n else soc0
-                fill_budget_wh = max(target_soc_wh - soc0, 0.0)
                 store_cap_wh = raw_cap_wh * charge_eff  # delivered-into-pack cap /slot
                 # SCR surface (learned): the energy that actually reaches the pack
                 # is (pv-load)×scr; the (1-scr) fraction is not storable surplus.
                 inv = getattr(sim, "inverter", None)
                 predictor = getattr(inv, "self_consumption_predictor", None) if inv else None
                 surplus_stored: dict[int, float] = {}
-                total_storable = 0.0
                 for h in range(start_slot, n):
                     s = float(pv[h]) - float(load[h])
                     if s <= 0.0:
@@ -1080,31 +1073,55 @@ class GeneticOptimization(OptimizationBase):
                     if st > EPS_WH:
                         surplus_slots.append(h)
                         surplus_stored[h] = st
-                        total_storable += st
-                spread = (
-                    max(revenue[h] for h in surplus_slots)
-                    - min(revenue[h] for h in surplus_slots)
-                    if surplus_slots
-                    else 0.0
-                )
-                # GATE 1 (more surplus than headroom → something spare to export) +
-                # GATE 2 (exploitable feed-in spread). Either failing → no-op,
-                # base [dc_state]*n untouched (byte-identical on flat/low-PV days).
-                if (
-                    total_storable > fill_budget_wh + EPS_WH
-                    and surplus_slots
-                    and spread > _PV_CHARGE_WINDOW_MIN_SPREAD
-                ):
-                    # Cheapest feed-in first; (revenue, h) tie-break keeps equal-price
-                    # slots time-contiguous → the trough fills as one block.
-                    order = sorted(surplus_slots, key=lambda h: (revenue[h], h))
-                    budget = fill_budget_wh
-                    for h in order:
-                        if budget <= EPS_WH:
-                            break
-                        store_set.add(h)
-                        budget -= surplus_stored[h]
-                    partition_active = True
+
+                # OPERATOR DIRECTIVE (Christin 2026-06-19, spec §OPERATOR DIRECTIVE):
+                # always fill the pack to FULL each day, storing the CHEAPEST surplus
+                # first and widening the cheap window by price until full. Apply the
+                # price-ascending partition PER CHARGE CYCLE (per contiguous daytime
+                # surplus block) over the 48h/192-slot horizon — sizing EACH cycle's
+                # budget to (max_soc − SoC entering that block) — so every day fills
+                # from its OWN cheapest window instead of one global single-fill
+                # budget spread across two days (the STOPPER-2 multi-day under-store).
+                # A deficit slot ends a block; the overnight deficit separates the
+                # per-day cycles. Budget targets max_soc_wh (FULL), NOT the
+                # self-consumption peak (operator override of the §3.2 NOTE).
+                blocks: list[list[int]] = []
+                if surplus_slots:
+                    cur = [surplus_slots[0]]
+                    for h in surplus_slots[1:]:
+                        if h == cur[-1] + 1:
+                            cur.append(h)
+                        else:
+                            blocks.append(cur)
+                            cur = [h]
+                    blocks.append(cur)
+                for block in blocks:
+                    bs = block[0]
+                    soc_entry = soc0 if bs <= start_slot else float(soc_traj[bs - 1])
+                    fill_budget_block = max(max_soc_wh - soc_entry, 0.0)
+                    block_storable = sum(surplus_stored[h] for h in block)
+                    revs = [revenue[h] for h in block]
+                    spread = (max(revs) - min(revs)) if revs else 0.0
+                    # GATE per cycle: flip the dearer slots to export ONLY if this
+                    # day has MORE surplus than its headroom (something spare) AND an
+                    # exploitable feed-in spread. Otherwise STORE the whole block —
+                    # never under-fill to optimise timing (operator priority: fill
+                    # the pack always). Flat/low-PV blocks → store all → byte-clean.
+                    if (
+                        block_storable > fill_budget_block + EPS_WH
+                        and spread > _PV_CHARGE_WINDOW_MIN_SPREAD
+                    ):
+                        # Cheapest feed-in first; (revenue, h) tie-break keeps equal-
+                        # price slots time-contiguous → the trough fills as one block.
+                        budget = fill_budget_block
+                        for h in sorted(block, key=lambda h: (revenue[h], h)):
+                            if budget <= EPS_WH:
+                                break
+                            store_set.add(h)
+                            budget -= surplus_stored[h]
+                        partition_active = True
+                    else:
+                        store_set.update(block)  # fill the whole cycle (no export flip)
 
             if partition_active:
                 # INVARIANT B: re-run the forward SoC trajectory charging ONLY in the
