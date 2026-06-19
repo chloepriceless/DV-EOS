@@ -46,11 +46,13 @@ _MODE = os.environ.get("EOS_PROBE_MODE", "seed")  # "seed" (Layer-A) | "ga" (dri
 
 
 def _config(config_eos):
+    interval = int(os.environ.get("EOS_PROBE_INTERVAL", "3600"))  # 900 = prod 15-min (192 slots)
     config_eos.merge_settings_from_dict(
         {
             "prediction": {"hours": 48},
             "optimization": {
                 "horizon_hours": 48,
+                "interval": interval,
                 "genetic": {
                     "individuals": 300,
                     "generations": 400,
