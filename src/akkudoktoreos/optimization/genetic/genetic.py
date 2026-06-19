@@ -101,6 +101,125 @@ try:
 except (TypeError, ValueError):
     _RESERVE_MIN_SAFETY_CAP_WH = 6000.0
 
+# DVhub fork (2026-06-19, Finding-1): coherent PV-surplus store/export warm-start
+# + DEAP elitism. The plain warm-start charge base is [dc_state]*n ("store
+# everywhere"), so on a high-PV day with MORE daytime surplus than headroom the
+# pack reaches the self-consumption target regardless of WHICH surplus slots
+# store — terminal SoC, residual value and evening arbitrage are identical, so the
+# ONLY differential is the daytime export-timing revenue (~1-1.5 EUR), diluted
+# below per-mutation GA noise on a flat fitness ridge. The GA then drifts off the
+# front-load every rolling re-opt (the documented Finding-1 receding-horizon
+# defer: it exports the CHEAP midday trough and charges from the DEARER afternoon).
+# When ON, the seed ranks daytime surplus by feed-in price ASCENDING, marks the
+# CHEAPEST slots dc_charge (store) up to the self-consumption fill budget, and
+# ACTIVELY FLIPS the dearer surplus slots to dc_not_allowed (export) — so the
+# seeded plan scores measurably better (a real ~0.28 EUR/gene gradient against
+# drift), and selBest elitism pins that superior individual in the breeding pool.
+# Default OFF -> the seed base reverts to [dc_state]*n exactly and the stock
+# eaMuPlusLambda runs verbatim -> byte-identical to today. Enable only after
+# rolling-replay validation + operator self-review + GO (R22); deploy via systemd
+# env (restart-robust, NOT API config — see the provider-restart gotcha).
+_PV_CHARGE_WINDOW_ENABLED = os.environ.get("EOS_PV_CHARGE_WINDOW", "0") not in (
+    "0",
+    "false",
+    "False",
+    "no",
+)
+try:
+    # Top-k individuals selBest pins deterministically each generation under
+    # elitism (0 disables the elitist path -> stock eaMuPlusLambda runs verbatim).
+    _PV_CHARGE_WINDOW_ELITE_K = int(os.environ.get("EOS_PV_CHARGE_WINDOW_ELITE_K", "2"))
+except (TypeError, ValueError):
+    _PV_CHARGE_WINDOW_ELITE_K = 2
+try:
+    # Min feed-in price spread (EUR/Wh) across the daytime surplus slots before the
+    # store/export partition acts, so flat-price days create no spurious separation
+    # (partition is a no-op below it -> byte-identical on flat days). ~1 ct/kWh.
+    _PV_CHARGE_WINDOW_MIN_SPREAD = float(
+        os.environ.get("EOS_PV_CHARGE_WINDOW_MIN_SPREAD_EUR_PER_WH", "0.00001")
+    )
+except (TypeError, ValueError):
+    _PV_CHARGE_WINDOW_MIN_SPREAD = 0.00001
+
+
+def _ea_mu_plus_lambda_elitist(
+    population,
+    toolbox,
+    mu,
+    lambda_,
+    cxpb,
+    mutpb,
+    ngen,
+    stats=None,
+    halloffame=None,
+    verbose=__debug__,
+    elite_k=2,
+):
+    """Verbatim copy of DEAP ``algorithms.eaMuPlusLambda`` (deap 1.4,
+    algorithms.py:248-336) with EXACTLY ONE changed line: the next-generation
+    selection (originally ``population[:] = toolbox.select(population + offspring,
+    mu)`` at algorithms.py:329) now carries the top-``elite_k`` individuals
+    deterministically via ``selBest`` and fills the remaining ``mu - elite_k``
+    slots with the original tournament select.
+
+    Rationale (DVhub fork 2026-06-19, Finding-1): stock eaMuPlusLambda has no
+    elite carry, so a fitness-superior population-inserted warm-start can be
+    tournament-dropped from the breeding pool even while it is the incumbent best.
+    Pinning the top-k (default 2 of mu=100 = 2 %, far below the diversity-collapse
+    threshold; lambda_=150 offspring + selTournament on the other 98 keep
+    exploration high) guarantees the seed's coherent front-load is refined FROM,
+    not drifted off. The Logbook is preserved intact (so fitness_history keeps
+    working) — this is why the verbatim-copy swap beats a per-gen ngen=1 loop.
+    Only ever invoked when EOS_PV_CHARGE_WINDOW is ON and elite_k>0; the stock
+    path is untouched, so the gate-OFF baseline draws the identical RNG sequence.
+    """
+    logbook = tools.Logbook()
+    logbook.header = ["gen", "nevals"] + (stats.fields if stats else [])
+
+    # Evaluate the individuals with an invalid fitness
+    invalid_ind = [ind for ind in population if not ind.fitness.valid]
+    fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+    for ind, fit in zip(invalid_ind, fitnesses):
+        ind.fitness.values = fit
+
+    if halloffame is not None:
+        halloffame.update(population)
+
+    record = stats.compile(population) if stats is not None else {}
+    logbook.record(gen=0, nevals=len(invalid_ind), **record)
+    if verbose:
+        print(logbook.stream)
+
+    # Begin the generational process
+    for gen in range(1, ngen + 1):
+        # Vary the population
+        offspring = algorithms.varOr(population, toolbox, lambda_, cxpb, mutpb)
+
+        # Evaluate the individuals with an invalid fitness
+        invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
+        fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+        for ind, fit in zip(invalid_ind, fitnesses):
+            ind.fitness.values = fit
+
+        # Update the hall of fame with the generated individuals
+        if halloffame is not None:
+            halloffame.update(offspring)
+
+        # --- THE ONE CHANGED LINE (was: population[:] = toolbox.select(population + offspring, mu)) ---
+        combined = population + offspring
+        elite = tools.selBest(combined, k=elite_k)  # deterministic top-k carry
+        rest = toolbox.select(combined, mu - elite_k)  # selTournament on the remainder
+        population[:] = elite + rest
+        # ---------------------------------------------------------------------------------------------
+
+        # Update the statistics with the new population
+        record = stats.compile(population) if stats is not None else {}
+        logbook.record(gen=gen, nevals=len(invalid_ind), **record)
+        if verbose:
+            print(logbook.stream)
+
+    return population, logbook
+
 
 def _compute_overnight_reserve(
     load_array: np.ndarray,
@@ -895,7 +1014,8 @@ class GeneticOptimization(OptimizationBase):
             # Forward self-consumption-only SoC trajectory + charge-episode flags.
             # PV surplus charges (DC), deficit self-consumes from the pack. No
             # arbitrage selling here — this is the baseline against which spare
-            # energy is measured.
+            # energy is measured. (time-greedy: fills morning-first.)
+            soc0 = soc_wh  # snapshot BEFORE the loop mutates soc_wh (fill-budget base)
             soc_traj = np.zeros(n, dtype=float)
             charging = np.zeros(n, dtype=bool)
             for h in range(start_slot, n):
@@ -912,6 +1032,104 @@ class GeneticOptimization(OptimizationBase):
                     soc_wh -= delivered / disch_eff
                 soc_traj[h] = soc_wh
 
+            # DVhub fork (2026-06-19, Finding-1): coherent PV store/export partition
+            # (the LAYER-A substantive fix). By default the trajectory/episodes use
+            # the time-greedy baseline above (gate OFF → byte-identical). When the
+            # gate is ON we partition daytime surplus by feed-in price: store the
+            # CHEAPEST slots up to the self-consumption fill budget, EXPORT the rest
+            # (the load-bearing flip to dc_not_allowed), then re-segment the
+            # discharge episodes from that PARTITIONED trajectory (INVARIANT B) so
+            # the seeded individual is internally coherent and ~1-1.5 EUR superior.
+            EPS_WH = 1.0  # consistent with the >1.0 guards above
+            store_gene = dc_state  # dc_allowed_state when optimize_dc_charge
+            export_gene = (3 * len_bat) if self.optimize_dc_charge else 0  # dc_not_allowed
+            partition_active = False
+            store_set: set[int] = set()
+            surplus_slots: list[int] = []
+            traj_used, charging_used = soc_traj, charging
+
+            if _PV_CHARGE_WINDOW_ENABLED and self.optimize_dc_charge:
+                # Fill budget sized to the self-consumption peak the baseline
+                # trajectory reaches (NOT max_soc_wh) — composes with the Finding-2
+                # reserve: store fills headroom, the sell side drains spare above
+                # reserve, disjoint bands, no over-store the reserve then dumps.
+                target_soc_wh = float(np.max(soc_traj[start_slot:n])) if start_slot < n else soc0
+                fill_budget_wh = max(target_soc_wh - soc0, 0.0)
+                store_cap_wh = raw_cap_wh * charge_eff  # delivered-into-pack cap /slot
+                # SCR surface (learned): the energy that actually reaches the pack
+                # is (pv-load)×scr; the (1-scr) fraction is not storable surplus.
+                inv = getattr(sim, "inverter", None)
+                predictor = getattr(inv, "self_consumption_predictor", None) if inv else None
+                surplus_stored: dict[int, float] = {}
+                total_storable = 0.0
+                for h in range(start_slot, n):
+                    s = float(pv[h]) - float(load[h])
+                    if s <= 0.0:
+                        continue
+                    scr_h = 1.0
+                    if predictor is not None:
+                        try:
+                            scr_h = float(
+                                predictor.calculate_self_consumption(float(load[h]), float(pv[h]))
+                            )
+                        except Exception:
+                            scr_h = 1.0
+                        if not (0.0 < scr_h <= 1.0):
+                            scr_h = 1.0
+                    st = min(s * scr_h * charge_eff, store_cap_wh)
+                    if st > EPS_WH:
+                        surplus_slots.append(h)
+                        surplus_stored[h] = st
+                        total_storable += st
+                spread = (
+                    max(revenue[h] for h in surplus_slots)
+                    - min(revenue[h] for h in surplus_slots)
+                    if surplus_slots
+                    else 0.0
+                )
+                # GATE 1 (more surplus than headroom → something spare to export) +
+                # GATE 2 (exploitable feed-in spread). Either failing → no-op,
+                # base [dc_state]*n untouched (byte-identical on flat/low-PV days).
+                if (
+                    total_storable > fill_budget_wh + EPS_WH
+                    and surplus_slots
+                    and spread > _PV_CHARGE_WINDOW_MIN_SPREAD
+                ):
+                    # Cheapest feed-in first; (revenue, h) tie-break keeps equal-price
+                    # slots time-contiguous → the trough fills as one block.
+                    order = sorted(surplus_slots, key=lambda h: (revenue[h], h))
+                    budget = fill_budget_wh
+                    for h in order:
+                        if budget <= EPS_WH:
+                            break
+                        store_set.add(h)
+                        budget -= surplus_stored[h]
+                    partition_active = True
+
+            if partition_active:
+                # INVARIANT B: re-run the forward SoC trajectory charging ONLY in the
+                # store_set slots (the dear surplus is exported, no SoC rise), then
+                # segment the discharge episodes from THIS partitioned trajectory.
+                soc2 = soc0
+                soc_traj2 = np.zeros(n, dtype=float)
+                charging2 = np.zeros(n, dtype=bool)
+                for h in range(start_slot, n):
+                    net = float(pv[h]) - float(load[h])
+                    if net >= 0.0:  # PV surplus
+                        if h in store_set:  # store only the cheap partition
+                            headroom = max(max_soc_wh - soc2, 0.0)
+                            stored = min(net * charge_eff, headroom, raw_cap_wh * charge_eff)
+                            if stored > 1.0:
+                                soc2 += stored
+                                charging2[h] = True
+                        # else: dear surplus exported → no SoC rise
+                    else:  # deficit → self-consume from the pack
+                        deliverable = min((soc2 - min_soc_wh) * disch_eff, sell_cap_wh)
+                        delivered = min(-net, max(deliverable, 0.0))
+                        soc2 -= delivered / disch_eff
+                    soc_traj2[h] = soc2
+                traj_used, charging_used = soc_traj2, charging2
+
             # Segment the horizon into charge runs → (peak_slot, window_end)
             # episodes. window_end is the next run's START (= next refill), so
             # each sell window holds only the post-peak discharge-down phase that
@@ -921,7 +1139,7 @@ class GeneticOptimization(OptimizationBase):
             runs: list[tuple[int, int]] = []  # (run_start, run_peak=last charging slot)
             run_start = None
             for h in range(start_slot, n):
-                if charging[h]:
+                if charging_used[h]:
                     if run_start is None:
                         run_start = h
                 elif run_start is not None:
@@ -940,7 +1158,7 @@ class GeneticOptimization(OptimizationBase):
             for peak, win_end in episodes:
                 if win_end <= peak:
                     continue
-                peak_deliverable = max((soc_traj[peak] - min_soc_wh) * disch_eff, 0.0)
+                peak_deliverable = max((traj_used[peak] - min_soc_wh) * disch_eff, 0.0)
                 sellable = peak_deliverable - float(reserve[peak])
                 if sellable <= 1.0:
                     continue
@@ -954,7 +1172,17 @@ class GeneticOptimization(OptimizationBase):
                     sellable -= sell_cap_wh
                     picked_any = True
 
-            if not picked_any:
+            # Apply the store/export partition AFTER the sell overwrite so a sell
+            # slot is never demoted to store/export (INVARIANT C). store_gene equals
+            # the base dc_state (no-op); the load-bearing change is flipping the
+            # dearer surplus slots to export_gene (dc_not_allowed).
+            if partition_active:
+                for h in surplus_slots:
+                    if genes[h] == discharge_state:
+                        continue  # INVARIANT C: never demote a sell slot
+                    genes[h] = store_gene if h in store_set else export_gene
+
+            if not (picked_any or partition_active):
                 return None
 
             # Pad EV + appliance gene segments to match create_individual()'s layout.
@@ -1454,19 +1682,39 @@ class GeneticOptimization(OptimizationBase):
             for _ in range(10):
                 population.insert(0, creator.Individual(greedy_seed))
 
-        # Run the evolutionary algorithm
-        pop, log = algorithms.eaMuPlusLambda(
-            population,
-            self.toolbox,
-            mu=100,
-            lambda_=150,
-            cxpb=0.6,
-            mutpb=0.4,
-            ngen=ngen,
-            stats=stats,
-            halloffame=hof,
-            verbose=self.verbose,
-        )
+        # Run the evolutionary algorithm.
+        # DVhub fork (2026-06-19, Finding-1): with the PV-charge-window gate ON and
+        # elitism, use the elitist eaMuPlusLambda copy that pins the top-k each
+        # generation, so the coherent fitness-superior warm-start is refined FROM,
+        # not tournament-dropped. Gate OFF (or elite_k=0) → the stock DEAP call runs
+        # verbatim with identical args → identical RNG sequence → byte-identical.
+        if _PV_CHARGE_WINDOW_ENABLED and _PV_CHARGE_WINDOW_ELITE_K > 0:
+            pop, log = _ea_mu_plus_lambda_elitist(
+                population,
+                self.toolbox,
+                mu=100,
+                lambda_=150,
+                cxpb=0.6,
+                mutpb=0.4,
+                ngen=ngen,
+                stats=stats,
+                halloffame=hof,
+                verbose=self.verbose,
+                elite_k=_PV_CHARGE_WINDOW_ELITE_K,
+            )
+        else:
+            pop, log = algorithms.eaMuPlusLambda(
+                population,
+                self.toolbox,
+                mu=100,
+                lambda_=150,
+                cxpb=0.6,
+                mutpb=0.4,
+                ngen=ngen,
+                stats=stats,
+                halloffame=hof,
+                verbose=self.verbose,
+            )
 
         # Store fitness history
         self.fitness_history = {
