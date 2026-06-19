@@ -52,15 +52,26 @@ def _load_day(csv_path: str):
     per-Wh rates. Missing edge slots (pre-dawn / post-data) are PV=0, feed-in
     edge-filled. Returns arrays + the real SoC per slot + prod setpoint."""
     rows = list(csv.DictReader(open(csv_path)))
+    # PV source: "realized" (perfect foresight, sharpest test) or "vintage" (the
+    # 02:04 overnight forecast prod most plausibly ran on — intraday vintages are
+    # not retrievable; this is the best available proxy, 30-min → forward-filled).
+    pv_src = os.environ.get("EOS_ROLL_PV", "realized")
     pv = [0.0] * SLOTS_PER_DAY
     feedin_ct = [None] * SLOTS_PER_DAY
     soc = [None] * SLOTS_PER_DAY
     setpoint = [None] * SLOTS_PER_DAY
+    last_vintage = 0.0
     for r in rows:
         t = r["slot_utc"]  # YYYY-MM-DDTHH:MM
         hh, mm = int(t[11:13]), int(t[14:16])
         i = hh * 4 + mm // 15
-        pv[i] = float(r["pv_realized_w"]) * 0.25  # W → Wh per 15-min slot
+        if pv_src == "vintage":
+            v = r.get("pv_vintage_w_0204", "")
+            if v not in ("", None):
+                last_vintage = float(v)
+            pv[i] = last_vintage * 0.25  # forward-fill the 30-min vintage to 15-min
+        else:
+            pv[i] = float(r["pv_realized_w"]) * 0.25  # W → Wh per 15-min slot
         feedin_ct[i] = float(r["feedin_ct_dayahead"])
         soc[i] = float(r["soc_seed_pct"])
         setpoint[i] = float(r["setpoint_w_actual"])
