@@ -116,9 +116,20 @@ except (TypeError, ValueError):
 # seeded plan scores measurably better (a real ~0.28 EUR/gene gradient against
 # drift), and selBest elitism pins that superior individual in the breeding pool.
 # Default OFF -> the seed base reverts to [dc_state]*n exactly and the stock
-# eaMuPlusLambda runs verbatim -> byte-identical to today. Enable only after
-# rolling-replay validation + operator self-review + GO (R22); deploy via systemd
-# env (restart-robust, NOT API config — see the provider-restart gotcha).
+# eaMuPlusLambda runs verbatim -> byte-identical to today.
+#
+# ⚠️ SHELVED — DO NOT ENABLE (validated 2026-06-19). A faithful per-step rolling
+# replay on the real prod data (real soc-seed + day-ahead prices, forecast- AND
+# reserve-state-invariant) showed EOS's GA ALREADY stores the cheap midday trough
+# and exports the dear morning correctly at prod's real per-step state — and the
+# live prod cross-check (06-19: EOS planned store, DVhub actuated store) confirmed
+# optimizer AND actuation are both correct. There is NO systematic morning charge-
+# timing defer in EOS; the 06-18 observation was an unreproducible anomaly (likely
+# an un-retained intraday forecast vintage or a transient), NOT the optimizer. This
+# warm-start therefore addresses a non-existent systematic problem and stays OFF.
+# Kept gate-OFF/byte-identical + the per-cycle full-charge budget (Christin's
+# directive) as ready-to-go IF a systematic need is ever demonstrated.
+# See .planning/FINDING-1-VALIDATION-2026-06-19.md §DAYTIME-PIVOT.
 _PV_CHARGE_WINDOW_ENABLED = os.environ.get("EOS_PV_CHARGE_WINDOW", "0") not in (
     "0",
     "false",
