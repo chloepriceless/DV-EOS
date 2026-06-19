@@ -11,6 +11,17 @@ def mock_battery() -> Mock:
     mock_battery.charge_energy = Mock(return_value=(0.0, 0.0))
     mock_battery.discharge_energy = Mock(return_value=(0.0, 0.0))
     mock_battery.parameters.device_id = "battery1"
+    # DVhub fork: the inverter reads battery.discharge_array[hour] (the genetic
+    # discharge gene) to gate battery→grid co-export. The upstream mock only
+    # stubbed the charge/discharge methods. An all-zero gene array keeps the DV
+    # co-export branches inert, so these upstream tests still assert the VANILLA
+    # numeric behaviour (the regression net) — the unit-level analogue of
+    # test_byte_identity. 48 entries cover hourly and 15-min slot indices.
+    mock_battery.discharge_array = [0] * 48
+    # The inverter re-grosses the delivered DC by the discharge efficiency to
+    # track the per-slot discharge power budget; a real Battery always exposes
+    # this. 1.0 keeps the existing numeric assertions unchanged.
+    mock_battery.discharging_efficiency = 1.0
     return mock_battery
 
 
@@ -119,7 +130,7 @@ def test_process_energy_battery_discharges(inverter, mock_battery):
     assert losses == 10.0  # Discharge losses
     assert self_consumption == 200.0  # Generation + battery discharge
     mock_battery.charge_energy.assert_not_called()
-    mock_battery.discharge_energy.assert_called_once_with(150.0, hour)
+    mock_battery.discharge_energy.assert_called_once_with(150.0, hour, ignore_gate=True)
     inverter.self_consumption_predictor.calculate_self_consumption.assert_not_called()
 
 
@@ -139,7 +150,7 @@ def test_process_energy_battery_empty(inverter, mock_battery):
     assert losses == 0.0  # No losses as the battery didn't discharge
     assert self_consumption == 100.0  # Only generation is consumed
     mock_battery.charge_energy.assert_not_called()
-    mock_battery.discharge_energy.assert_called_once_with(200.0, hour)
+    mock_battery.discharge_energy.assert_called_once_with(200.0, hour, ignore_gate=True)
     inverter.self_consumption_predictor.calculate_self_consumption.assert_not_called()
 
 
@@ -183,7 +194,7 @@ def test_process_energy_insufficient_generation_no_battery(inverter, mock_batter
     assert losses == 0.0  # No losses
     assert self_consumption == 100.0  # Only generation is consumed
     mock_battery.charge_energy.assert_not_called()
-    mock_battery.discharge_energy.assert_called_once_with(400.0, hour)
+    mock_battery.discharge_energy.assert_called_once_with(400.0, hour, ignore_gate=True)
     inverter.self_consumption_predictor.calculate_self_consumption.assert_not_called()
 
 
@@ -208,7 +219,7 @@ def test_process_energy_insufficient_generation_battery_assists(inverter, mock_b
     assert losses == 5.0  # Discharge losses
     assert self_consumption == 250.0  # Generation + battery discharge
     mock_battery.charge_energy.assert_not_called()
-    mock_battery.discharge_energy.assert_called_once_with(200.0, hour)
+    mock_battery.discharge_energy.assert_called_once_with(200.0, hour, ignore_gate=True)
     inverter.self_consumption_predictor.calculate_self_consumption.assert_not_called()
 
 
@@ -231,7 +242,7 @@ def test_process_energy_zero_generation(inverter, mock_battery):
     assert losses == 5.0  # Discharge losses
     assert self_consumption == 100.0  # Only battery discharge is consumed
     mock_battery.charge_energy.assert_not_called()
-    mock_battery.discharge_energy.assert_called_once_with(300.0, hour)
+    mock_battery.discharge_energy.assert_called_once_with(300.0, hour, ignore_gate=True)
     inverter.self_consumption_predictor.calculate_self_consumption.assert_not_called()
 
 
@@ -294,7 +305,7 @@ def test_process_energy_partial_battery_discharge(inverter, mock_battery):
     assert losses == 5.0  # Discharge losses
     assert self_consumption == 250.0  # Generation + battery discharge
     mock_battery.charge_energy.assert_not_called()
-    mock_battery.discharge_energy.assert_called_once_with(200.0, 12)
+    mock_battery.discharge_energy.assert_called_once_with(200.0, 12, ignore_gate=True)
     inverter.self_consumption_predictor.calculate_self_consumption.assert_not_called()
 
 
@@ -314,7 +325,7 @@ def test_process_energy_consumption_exceeds_max_no_battery(inverter, mock_batter
     assert losses == 0.0  # No losses as the battery didn’t assist
     assert self_consumption == 100.0  # Only the generation is consumed, maxing out the inverter
     mock_battery.charge_energy.assert_not_called()
-    mock_battery.discharge_energy.assert_called_once_with(400.0, hour)
+    mock_battery.discharge_energy.assert_called_once_with(400.0, hour, ignore_gate=True)
     inverter.self_consumption_predictor.calculate_self_consumption.assert_not_called()
 
 
@@ -336,5 +347,5 @@ def test_process_energy_zero_generation_full_battery_high_consumption(inverter, 
     assert losses == 10.0  # Battery discharge losses
     assert self_consumption == 500.0  # Battery fully discharges to meet consumption
     mock_battery.charge_energy.assert_not_called()
-    mock_battery.discharge_energy.assert_called_once_with(500.0, hour)
+    mock_battery.discharge_energy.assert_called_once_with(500.0, hour, ignore_gate=True)
     inverter.self_consumption_predictor.calculate_self_consumption.assert_not_called()
