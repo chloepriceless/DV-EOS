@@ -419,3 +419,198 @@ def test_case1_coexport_respects_battery_discharge_power_cap():
         f"battery discharged {total_raw} Wh raw in one slot, exceeding the "
         f"{max_raw_slot_wh} Wh per-slot power cap (release-review #3 regression)"
     )
+
+
+# ---------------------------------------------------------------------------
+# DVhub fork: Case-1 battery->grid CO-EXPORT feature characterization
+# (gate EOS_BATTERY_GRID_EXPORT, inverter.py:166-219).
+#
+# The power-cap edge of this path is covered above
+# (test_case1_coexport_respects_battery_discharge_power_cap); these tests
+# characterize the FEATURE itself — that the battery actually co-exports in
+# Case 1, the two gates (env + discharge gene), and the SoC / reserve / inverter
+# headroom limits — which had no dedicated coverage (the documented coverage gap).
+#
+# Isolation trick: generation == consumption is the Case-1 boundary, so the PV
+# surplus is exactly zero -> no battery charge (inverter.py:143) and no
+# self-consumption discharge (inverter.py:120). The returned grid_export is then
+# the pure battery co-export, with clean unit efficiencies (1.0) so the oracle is
+# hand-computable. The per-slot power cap is set non-binding (20 kW) so it never
+# masks the SoC/reserve/headroom limits under test.
+# ---------------------------------------------------------------------------
+
+
+def _coexport_setup(
+    *,
+    soc_pct: float,
+    max_power_wh: float,
+    min_soc_pct: float = 10.0,
+    cap_wh: float = 10000.0,
+    max_charge_power_w: float = 20000.0,
+    disch_eff: float = 1.0,
+    dc_to_ac: float = 1.0,
+):
+    """Build a REAL Battery + Inverter wired for the Case-1 co-export path.
+
+    Efficiencies default to 1.0 (raw == delivered == AC) for clean arithmetic;
+    pass disch_eff / dc_to_ac to characterize the conversion wiring.
+    """
+    params = SolarPanelBatteryParameters(
+        device_id="battery1",
+        capacity_wh=cap_wh,
+        initial_soc_percentage=soc_pct,
+        charging_efficiency=1.0,
+        discharging_efficiency=disch_eff,
+        min_soc_percentage=min_soc_pct,
+        max_soc_percentage=100,
+        max_charge_power_w=max_charge_power_w,  # per-slot discharge power cap (non-binding here)
+        hours=48,
+    )
+    battery = Battery(params, prediction_hours=48, slot_duration_h=1.0)
+    battery.reset()
+    mock_pred = Mock()
+    mock_pred.calculate_self_consumption.return_value = 1.0
+    with patch(
+        "akkudoktoreos.devices.genetic.inverter.get_eos_load_interpolator",
+        return_value=mock_pred,
+    ):
+        iv = Inverter(
+            InverterParameters(
+                device_id="iv1",
+                max_power_wh=max_power_wh,
+                battery_id="battery1",
+                dc_to_ac_efficiency=dc_to_ac,
+            ),
+            battery=battery,
+            slot_duration_h=1.0,
+        )
+    return iv, battery
+
+
+def test_case1_coexport_sells_battery_bounded_by_inverter_headroom():
+    """Gate + discharge gene on: the battery co-exports in Case 1, capped by the
+    inverter AC headroom (max_power_wh - load) when SoC is plentiful."""
+    iv, battery = _coexport_setup(soc_pct=80, max_power_wh=5000.0)  # 8000 Wh, headroom 4000
+    hour = 12
+    battery.discharge_array[hour] = 1  # discharge gene on
+    soc_before = battery.soc_wh
+
+    grid_export, grid_import, losses, self_consumption = iv.process_energy(
+        generation=1000.0, consumption=1000.0, hour=hour
+    )
+
+    # headroom = max_power_wh - load = 5000 - 1000 = 4000; SoC-unreserved = 7000 -> headroom binds
+    assert grid_export == pytest.approx(4000.0)
+    assert grid_import == pytest.approx(0.0)
+    assert self_consumption == pytest.approx(1000.0)
+    assert battery.soc_wh == pytest.approx(soc_before - 4000.0)
+
+
+def test_case1_coexport_drains_only_to_min_soc():
+    """With ample inverter headroom the co-export is bounded by the usable SoC
+    above the hard floor and never drains the battery below min_soc."""
+    iv, battery = _coexport_setup(soc_pct=80, max_power_wh=100000.0)  # 8000 Wh, headroom huge
+    hour = 12
+    battery.discharge_array[hour] = 1
+
+    grid_export, _, _, _ = iv.process_energy(
+        generation=1000.0, consumption=1000.0, hour=hour
+    )
+
+    # usable = soc - min_soc = 8000 - 1000 = 7000; headroom non-binding -> sells 7000
+    assert grid_export == pytest.approx(7000.0)
+    assert battery.soc_wh == pytest.approx(battery.min_soc_wh)  # exactly the floor, not below
+    assert battery.soc_wh == pytest.approx(1000.0)
+
+
+def test_case1_coexport_off_when_gate_disabled(monkeypatch):
+    """Negative control: with EOS_BATTERY_GRID_EXPORT off the battery never
+    co-exports in Case 1 (vanilla / Option-A fallback) — grid_export stays 0 and
+    the SoC is untouched, even though the discharge gene is on."""
+    monkeypatch.setattr(
+        "akkudoktoreos.devices.genetic.inverter._BATTERY_GRID_EXPORT_ENABLED", False
+    )
+    iv, battery = _coexport_setup(soc_pct=80, max_power_wh=100000.0)
+    hour = 12
+    battery.discharge_array[hour] = 1  # gene on, but gate off -> still no co-export
+    soc_before = battery.soc_wh
+
+    grid_export, _, _, _ = iv.process_energy(
+        generation=1000.0, consumption=1000.0, hour=hour
+    )
+
+    assert grid_export == pytest.approx(0.0)
+    assert battery.soc_wh == pytest.approx(soc_before)  # battery untouched
+
+
+def test_case1_coexport_off_when_discharge_gene_zero():
+    """Second gate: even with EOS_BATTERY_GRID_EXPORT on, a slot whose discharge
+    gene is 0 does not co-export (the GA controls WHEN to sell)."""
+    iv, battery = _coexport_setup(soc_pct=80, max_power_wh=100000.0)
+    hour = 12
+    # discharge_array[hour] stays 0 from reset() -> gene off
+    soc_before = battery.soc_wh
+
+    grid_export, _, _, _ = iv.process_energy(
+        generation=1000.0, consumption=1000.0, hour=hour
+    )
+
+    assert grid_export == pytest.approx(0.0)
+    assert battery.soc_wh == pytest.approx(soc_before)
+
+
+def test_case1_coexport_holds_overnight_reserve():
+    """export_reserve_ac_wh is a SoC floor for the EXPORT branch: the co-export
+    sells only the surplus ABOVE (min_soc + reserve), so the pack keeps the
+    overnight self-consumption reserve instead of being sold empty at the peak."""
+    iv, battery = _coexport_setup(soc_pct=80, max_power_wh=100000.0)  # 8000 Wh, headroom huge
+    hour = 12
+    battery.discharge_array[hour] = 1
+
+    grid_export, _, _, _ = iv.process_energy(
+        generation=1000.0, consumption=1000.0, hour=hour, export_reserve_ac_wh=3000.0
+    )
+
+    # usable above floor+reserve = 8000 - 1000 - 3000 = 4000 -> sells 4000
+    assert grid_export == pytest.approx(4000.0)
+    # ends at min_soc + reserve = 1000 + 3000 = 4000 Wh (reserve held)
+    assert battery.soc_wh == pytest.approx(4000.0)
+
+
+def test_case1_coexport_fully_suppressed_when_reserve_covers_usable_soc():
+    """Boundary: a reserve >= the usable SoC above the hard floor suppresses
+    co-export entirely — the battery holds everything for overnight self-
+    consumption rather than selling any of it."""
+    iv, battery = _coexport_setup(soc_pct=80, max_power_wh=100000.0)  # usable above floor = 7000
+    hour = 12
+    battery.discharge_array[hour] = 1
+    soc_before = battery.soc_wh
+
+    grid_export, _, _, _ = iv.process_energy(
+        generation=1000.0, consumption=1000.0, hour=hour, export_reserve_ac_wh=8000.0
+    )
+
+    assert grid_export == pytest.approx(0.0)
+    assert battery.soc_wh == pytest.approx(soc_before)  # nothing sold, full reserve held
+
+
+def test_case1_coexport_applies_discharge_and_inverter_efficiencies():
+    """Co-export converts pack DC to grid AC through BOTH the battery discharge
+    efficiency AND the inverter DC->AC efficiency; the SoC drawdown is the raw
+    (re-grossed) energy. The other co-export tests use unity efficiencies, so this
+    is the one that pins down the conversion wiring (inverter.py:210/221/224)."""
+    iv, battery = _coexport_setup(
+        soc_pct=80, max_power_wh=100000.0, disch_eff=0.9, dc_to_ac=0.95
+    )  # usable raw above floor = 7000, inverter headroom non-binding
+    hour = 12
+    battery.discharge_array[hour] = 1
+
+    grid_export, _, _, _ = iv.process_energy(
+        generation=1000.0, consumption=1000.0, hour=hour
+    )
+
+    # ac delivered = usable_raw * disch_eff * dc_to_ac = 7000 * 0.9 * 0.95 = 5985 (SoC-bound)
+    assert grid_export == pytest.approx(5985.0)
+    # the full usable raw (7000 Wh) leaves the pack -> ends exactly at the hard floor
+    assert battery.soc_wh == pytest.approx(battery.min_soc_wh)
+    assert battery.soc_wh == pytest.approx(1000.0)
