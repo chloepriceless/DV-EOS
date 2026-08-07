@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 from loguru import logger
@@ -5,6 +6,67 @@ from loguru import logger
 from akkudoktoreos.devices.genetic.battery import Battery
 from akkudoktoreos.optimization.genetic.geneticdevices import InverterParameters
 from akkudoktoreos.prediction.interpolator import get_eos_load_interpolator
+
+
+# DVhub-Portierung 2026-08-07 (ursprünglich 2026-07-20/21, Christin) —
+# lastabhängige Wechselrichter-Wirkungsgradkurve.
+#
+# Das Serienmodell rechnet JEDE Wandlung mit EINER konstanten
+# dc_to_ac_efficiency: eine 200-W-Trickle-Entladung gilt als genauso effizient
+# wie ein 4-kW-Block, obwohl ein realer MultiPlus bei kleiner Teillast deutlich
+# schlechter ist (feste Verluste). Die Kurve ist NORMIERT über die
+# Slot-AC-Auslastung (ac_wh / max_power_wh = P/Pnenn) angegeben, damit dieselbe
+# Kurve über Gerätegrößen skaliert: Parallelschaltung erhält η(P/Pnenn) exakt.
+#
+# Format: EOS_INVERTER_EFF_CURVE="frac:eta,frac:eta,..."
+#   z. B. "0.02:0.75,0.05:0.86,0.10:0.92,0.20:0.945,0.35:0.95,0.60:0.945,1.0:0.93"
+# Nicht gesetzt/leer/unparsbar → AUS, byte-identisches Verhalten mit der
+# Konstanten. Ist sie AN, ERSETZT die Kurve dc_to_ac_efficiency für die echten
+# DC→AC-Wandlungen; sie multipliziert NICHT obendrauf (DVhub liefert
+# dc_to_ac_efficiency=1.0, die Umlaufverluste stecken heute in den
+# Batteriewirkungsgraden — siehe dvhub eos-config-sync.js buildEosInverters.
+# Geht die Kurve scharf, muss optimizer.roundTripEfficiency auf den reinen
+# Batteriewert gesenkt werden, sonst werden Verluste doppelt gezählt).
+def _parse_eff_curve(raw: str):
+    """'frac:eta,...' → sortierte [(frac, eta), ...] mit ≥2 Punkten, sonst None."""
+    if not raw:
+        return None
+    points = []
+    try:
+        for token in raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            frac_s, eta_s = token.split(":")
+            frac, eta = float(frac_s), float(eta_s)
+            if not (0.0 <= frac <= 1.0) or not (0.0 < eta <= 1.0):
+                logger.warning(f"EOS_INVERTER_EFF_CURVE: point out of range, curve OFF: {token}")
+                return None
+            points.append((frac, eta))
+    except ValueError:
+        logger.warning(f"EOS_INVERTER_EFF_CURVE: unparsable, curve OFF: {raw!r}")
+        return None
+    points.sort()
+    if len(points) < 2:
+        logger.warning("EOS_INVERTER_EFF_CURVE: needs >=2 points, curve OFF")
+        return None
+    return points
+
+
+_EFF_CURVE = _parse_eff_curve(os.environ.get("EOS_INVERTER_EFF_CURVE", ""))
+
+# v2 (Christin 2026-07-21): Reserve-/Kapazitäts-Übersetzungen aggregieren VIELE
+# künftige Nacht-Slots — es gibt dort keine einzelne Wandlungsgröße, an der man
+# η auswerten könnte. Sie nutzen deshalb η an einem definierten
+# NACHT-ARBEITSPUNKT (NIGHT_FRAC × Pnenn, Vorgabe 6 % ≈ 1,4 kW auf 24 kW —
+# typische nächtliche Hauslast). v1 behielt dort die Konstante und dimensionierte
+# die Reserve zu klein, sobald die Kurve an war (Replay 16.07.: Nacht-Netzbezug
+# 0,04 → 0,88 kWh). Mit η_night < 1 bindet dieselbe AC-Reserve MEHR SoC-Wh.
+_EFF_CURVE_NIGHT_FRAC = 0.06
+try:
+    _EFF_CURVE_NIGHT_FRAC = float(os.environ.get("EOS_INVERTER_EFF_CURVE_NIGHT_FRAC", "0.06"))
+except ValueError:
+    logger.warning("EOS_INVERTER_EFF_CURVE_NIGHT_FRAC unparsable, using 0.06")
 
 
 class Inverter:
@@ -34,14 +96,53 @@ class Inverter:
         # slot-independent charge-factor limit.
         self.max_ac_charge_power_w = self.parameters.max_ac_charge_power_w
 
+    def _dc_ac_eff(self, ac_wh: float) -> float:
+        """DC→AC-Wirkungsgrad für EINE Wandlung, die in diesem Slot ac_wh liefert.
+
+        Mit gesetzter EOS_INVERTER_EFF_CURVE: lineare Interpolation von η über
+        die Slot-AC-Auslastung frac = ac_wh / max_power_wh (∈[0,1], also
+        P/Pnenn — max_power_wh ist bereits slot-skaliert, das Verhältnis damit
+        dimensionslos). Außerhalb auf die Randpunkte geklemmt. Ohne Kurve: die
+        Konstante (Legacy, byte-identisch).
+        """
+        if not _EFF_CURVE:
+            return self.dc_to_ac_efficiency
+        cap = self.max_power_wh
+        frac = 0.0 if cap <= 0 else min(max(ac_wh / cap, 0.0), 1.0)
+        points = _EFF_CURVE
+        if frac <= points[0][0]:
+            return points[0][1]
+        if frac >= points[-1][0]:
+            return points[-1][1]
+        for i in range(1, len(points)):
+            f1, e1 = points[i]
+            if frac <= f1:
+                f0, e0 = points[i - 1]
+                t = (frac - f0) / (f1 - f0) if f1 > f0 else 0.0
+                return e0 + t * (e1 - e0)
+        return points[-1][1]
+
+    def _ref_eff(self) -> float:
+        """Referenz-η für Reserve-/Kapazitäts-Übersetzungen (v2).
+
+        Ohne Kurve: die Konstante (byte-identisches Legacy-Verhalten).
+        """
+        if not _EFF_CURVE:
+            return self.dc_to_ac_efficiency
+        return self._dc_ac_eff(_EFF_CURVE_NIGHT_FRAC * self.max_power_wh)
+
     def _discharge_battery_to_ac(self, requested_ac_wh: float, hour: int) -> tuple[float, float]:
         """Discharge battery energy and convert it to AC energy."""
         if not self.battery or requested_ac_wh <= 0.0:
             return 0.0, 0.0
 
-        dc_request = requested_ac_wh / self.dc_to_ac_efficiency
+        # DVhub-Portierung: η aus der Kurve, ausgewertet an der ANGEFRAGTEN
+        # AC-Größe. Ohne Kurve liefert _dc_ac_eff() die Konstante zurück, der
+        # Pfad bleibt dann byte-identisch zum Original.
+        eta = self._dc_ac_eff(requested_ac_wh)
+        dc_request = requested_ac_wh / eta
         battery_discharge_dc, discharge_losses = self.battery.discharge_energy(dc_request, hour)
-        battery_discharge_ac = battery_discharge_dc * self.dc_to_ac_efficiency
+        battery_discharge_ac = battery_discharge_dc * eta
         inverter_discharge_losses = battery_discharge_dc - battery_discharge_ac
         return battery_discharge_ac, discharge_losses + inverter_discharge_losses
 
@@ -124,7 +225,9 @@ class Inverter:
 
         if allow_battery_grid_export and self.battery and remaining_inverter_ac_capacity > 0.0:
             remaining_battery_ac = (
-                self.battery.remaining_discharge_energy_wh(hour) * self.dc_to_ac_efficiency
+                # DVhub-Portierung: Kapazitäts-Vorschätzung, keine echte
+                # Wandlung → Referenz-η am Nacht-Arbeitspunkt (v2).
+                self.battery.remaining_discharge_energy_wh(hour) * self._ref_eff()
             )
             export_capacity = min(remaining_inverter_ac_capacity, remaining_battery_ac)
             battery_export_ac, battery_export_losses = self._discharge_battery_to_ac(
