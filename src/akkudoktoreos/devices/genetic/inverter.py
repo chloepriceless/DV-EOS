@@ -152,6 +152,7 @@ class Inverter:
         consumption: float,
         hour: int,
         allow_battery_grid_export: bool = False,
+        export_reserve_ac_wh: float = 0.0,
     ) -> tuple[float, float, float, float]:
         """Process one slot using probabilistic direct PV-to-load overlap.
 
@@ -160,6 +161,14 @@ class Inverter:
         PV-to-load power. The remaining load and PV surplus are then handled
         independently, because both can occur during different sub-intervals of
         the same hourly or 15-minute slot.
+
+        ``export_reserve_ac_wh`` (DVhub-Portierung 2026-08-07): der
+        Eigenverbrauch (Last − PV), den der Akku von NACH diesem Slot bis zur
+        nächsten PV-Deckung noch tragen muss — als gelieferte AC-Energie. Der
+        Akku→Netz-EXPORT darf den Speicher nicht unter diese Reserve ziehen,
+        sonst wird er am Abendpeak leer verkauft und die Nacht anschließend aus
+        dem Netz zurückgekauft. Betrifft NUR den Export; die Deckung der lokalen
+        Last bleibt unangetastet. 0.0 = aus, Pfad dann identisch zum Original.
         """
         losses = 0.0
         grid_export = 0.0
@@ -229,7 +238,14 @@ class Inverter:
                 # Wandlung → Referenz-η am Nacht-Arbeitspunkt (v2).
                 self.battery.remaining_discharge_energy_wh(hour) * self._ref_eff()
             )
-            export_capacity = min(remaining_inverter_ac_capacity, remaining_battery_ac)
+            # DVhub-Portierung: die Nacht-Reserve wird VOM EXPORTIERBAREN
+            # Anteil abgezogen, nicht vom Akku selbst. Was die lokale Last
+            # deckt, ist oben bereits passiert und bleibt unberührt — die
+            # Reserve verhindert nur den Verkauf des Nachtvorrats.
+            exportable_battery_ac = max(
+                remaining_battery_ac - max(float(export_reserve_ac_wh), 0.0), 0.0
+            )
+            export_capacity = min(remaining_inverter_ac_capacity, exportable_battery_ac)
             battery_export_ac, battery_export_losses = self._discharge_battery_to_ac(
                 export_capacity, hour
             )

@@ -151,11 +151,6 @@ def test_ref_eff_night_operating_point(monkeypatch):
     assert iv2._ref_eff() == iv2.dc_to_ac_efficiency
 
 
-@pytest.mark.skip(
-    reason="Braucht die Ueberhang-Freigabe (export_reserve_ac_wh in process_energy). "
-    "Die ist beim Port auf Andreas' Zweig 2026-08-07 noch nicht uebernommen — "
-    "Test bleibt stehen, damit er beim Nachziehen der Freigabe sofort greift."
-)
 def test_reserve_translation_holds_more_soc_with_curve(monkeypatch):
     """v2-Kern: gleiche AC-Reserve => MEHR zurueckgehaltene SoC-Wh bei eta<1.
 
@@ -173,11 +168,19 @@ def test_reserve_translation_holds_more_soc_with_curve(monkeypatch):
         battery.min_soc_wh = 0.0
         battery.charge_energy = Mock(return_value=(0.0, 0.0))
         battery.discharge_energy = Mock(side_effect=lambda dc, hour, **kw: (dc, 0.0))
+        # Portierung: Andreas' Export-Pfad fragt remaining_discharge_energy_wh
+        # ab (DC-Rest, bereits mit discharging_efficiency verrechnet). Passend
+        # zu soc_wh=1000, min_soc_wh=0, disch_eff=1.0.
+        battery.remaining_discharge_energy_wh = Mock(return_value=1000.0)
         iv = _make_inverter(inv_mod, max_power_wh=10000.0, battery=battery)
         # gen 0 < cons 100: shortfall 100, Rest der Akku-Energie oberhalb der
         # Reserve darf exportiert werden.
+        # Portierung 2026-08-07: Andreas hat die Export-Freigabe vom
+        # discharge_array-Gen auf den expliziten Parameter
+        # allow_battery_grid_export umgestellt. Ohne ihn exportiert der
+        # Wechselrichter gar nichts und der Test verglich 0 mit 0.
         grid_export, grid_import, losses, sc = iv.process_energy(
-            0.0, 100.0, 12, export_reserve_ac_wh=200.0
+            0.0, 100.0, 12, allow_battery_grid_export=True, export_reserve_ac_wh=200.0
         )
         return grid_export
 

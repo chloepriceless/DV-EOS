@@ -1,5 +1,6 @@
 """Genetic algorithm."""
 
+import os
 import random
 import time
 from collections import OrderedDict, defaultdict
@@ -94,6 +95,337 @@ class BatteryStateLayout:
     dc_allowed_state: Optional[int] = None
     grid_export_state: Optional[int] = None
     self_consumption_state: Optional[int] = None
+
+
+
+# ---------------------------------------------------------------------------
+# DVhub-Portierung 2026-08-07 — Nacht-Reserve (Ueberhang-Freigabe).
+#
+# Neu aufgesetzt auf Andreas' feat/direct-marketing-battery-grid-export.
+# Der Block ist modulweit und in sich geschlossen; die Einhaengung sitzt weiter
+# unten in simulate() bzw. am process_energy()-Aufruf.
+#
+# Upstream hat diese Funktion NICHT: unser PR #1157 ("Direct marketing:
+# overnight reserve (price-aware)") ist bei Akkudoktor seit 19.07. offen und
+# nicht gemergt. `EOS_RESERVE*` findet sich in Andreas' Zweig in 0 Dateien.
+#
+# Voreinstellungen unveraendert uebernommen: Energiebilanz-Reserve AN,
+# preisbewusste Freigabe AUS, Wirkungsgrad-Korrektur AUS, WATERFALL AUS.
+# ---------------------------------------------------------------------------
+# DVhub fork (2026-05-29): overnight self-consumption reserve for the
+# battery→grid arbitrage discharge (Option B). Without it the optimizer empties
+# the battery into the evening price peak and buys the whole night's load back
+# from the grid. With it, grid-export discharge must leave enough charge to
+# cover the forecast net load (load − PV) until PV next covers load the next
+# morning. Self-consumption (covering load) is NOT limited — it consumes the
+# reserve through the night, ending near the floor as morning PV takes over.
+# EOS_OVERNIGHT_RESERVE=0 (then restart eos) disables it → sell to the floor.
+# EOS_OVERNIGHT_RESERVE_MARGIN pads the forecast against under-prediction.
+_OVERNIGHT_RESERVE_ENABLED = os.environ.get("EOS_OVERNIGHT_RESERVE", "1") not in (
+    "0",
+    "false",
+    "False",
+    "no",
+)
+try:
+    _OVERNIGHT_RESERVE_MARGIN = float(os.environ.get("EOS_OVERNIGHT_RESERVE_MARGIN", "1.1"))
+except (TypeError, ValueError):
+    _OVERNIGHT_RESERVE_MARGIN = 1.1
+
+# DVhub fork (2026-06-18): PRICE-AWARE overnight reserve. The energy-balance
+# reserve above is price-blind — it holds the full forecast night net-load as a
+# hard SoC floor on grid export, so the optimizer cannot sell that energy into a
+# high evening peak even when selling now + re-buying cheaper overnight is clearly
+# better (the documented Finding-2 loss). When enabled, each slot's reserve is
+# RELEASED (down to a small hard safety floor) whenever the best still-reachable
+# export price beats the highest avoided night-import price by more than a spread
+# threshold. avoided_import is read per-slot from elect_price_hourly — the
+# resolved end-customer import price (fixed-period / dynamic / §14a are resolved
+# UPSTREAM by the DVhub bridge), so this stays tariff-agnostic and carries no
+# tariff logic in EOS. Default OFF -> byte-identical to the price-blind reserve.
+# ⚠️ Correctness depends on elect_price_hourly being the RESOLVED end-customer
+# import price, not raw spot — the DVhub bridge ensures this per setup (fixed ->
+# flat gross tariff via eos-forecast-bridge.js; dynamic -> spot + markup), so
+# avoided_import is right for every tariff mode. Enable only after dev validation
+# + R22 review + operator GO (the normal path); default OFF until then.
+_RESERVE_PRICE_AWARE_ENABLED = os.environ.get("EOS_RESERVE_PRICE_AWARE", "0") not in (
+    "0",
+    "false",
+    "False",
+    "no",
+)
+# RELATIVE release margin (DVhub fork 2026-06-28, operator request): the reserve
+# releases when the reachable export price beats the avoided night-import price by
+# this FRACTION — best_export > avoided_import × (1 + margin). Relative, not a
+# fixed ct amount, so it tracks the resolved import price per slot and stays
+# correct for fixed AND dynamic tariffs (a dynamic-tariff user with a cheap night
+# gets a proportionally smaller required spread, not a flat 5 ct). 0.20 = "sell the
+# reserve only when the price covers the night buy-back + 20% loss".
+try:
+    _RESERVE_RELEASE_MARGIN = float(os.environ.get("EOS_RESERVE_RELEASE_MARGIN", "0.20"))
+except (TypeError, ValueError):
+    _RESERVE_RELEASE_MARGIN = 0.20
+# OPTIONAL additional ABSOLUTE floor (EUR/Wh) added on top of the relative margin
+# before the reserve releases. Default 0 → pure relative. Raise it to also demand a
+# minimum absolute spread (e.g. to suppress release when both prices are tiny).
+try:
+    _RESERVE_RELEASE_SPREAD = float(
+        os.environ.get("EOS_RESERVE_RELEASE_SPREAD_EUR_PER_WH", "0.0")
+    )
+except (TypeError, ValueError):
+    _RESERVE_RELEASE_SPREAD = 0.0
+# EFFICIENCY-ADJUSTED release threshold (Christin 2026-07-21). The plain gate
+# compares AC prices symmetrically — but the SAME battery-kWh has ASYMMETRIC
+# efficiency in its two uses: overnight self-consumption runs the inverter at
+# deep partial load (measured η≈0.80 on prod), a bulk evening sale at high
+# power (η≈0.89). One DC-kWh therefore displaces only import_price×η_night of
+# grid import but earns spot×η_sell when sold — break-even is at
+# spot = import × (η_night/η_sell) ≈ import × 0.90, NOT at import × 1.2.
+# With this gate ON the threshold becomes
+#   avoided_import × (η_night/η_sell) × (1+margin) + spread
+# so MARGIN is a true risk margin again instead of a hidden loss buffer.
+# Requires the efficiency curve (inverter._dc_ac_eff/_ref_eff, v2) — without a
+# curve both η are the same constant, the ratio is 1.0 and behaviour is
+# byte-identical even when enabled. Default OFF.
+_RESERVE_EFF_ADJUST = os.environ.get("EOS_RESERVE_EFF_ADJUST", "0") not in (
+    "0",
+    "false",
+    "False",
+    "no",
+    "",
+)
+
+
+def _reserve_eff_ratio(inverter, sell_cap_ac_wh):
+    """η_night/η_sell from the inverter efficiency curve, or None (→ 1.0).
+
+    η_night = curve at the night operating point (_ref_eff, NIGHT_FRAC×Pnenn);
+    η_sell = curve at the per-slot sell cap (the power a bulk sale actually
+    runs at). Battery efficiency cancels out (identical in both chains).
+    """
+    if not _RESERVE_EFF_ADJUST or inverter is None:
+        return None
+    try:
+        e_night = inverter._ref_eff()
+        e_sell = (
+            inverter._dc_ac_eff(sell_cap_ac_wh)
+            if (sell_cap_ac_wh is not None and sell_cap_ac_wh > 0)
+            else e_night
+        )
+        if e_night > 0 and e_sell > 0:
+            return float(e_night) / float(e_sell)
+    except Exception:  # noqa: BLE001 — defensiv: Gate darf den GA nie brechen
+        pass
+    return None
+
+
+# Load-adaptive self-consumption safety floor (delivered-AC Wh) that is NEVER
+# released. Sized to THIS night's own forecast net-load so a load-heavy (winter)
+# night keeps more and a light night less, then clamped to a hard floor and a
+# moderate cap: safety = clamp(full_night_reserve × fraction, floor, cap). The
+# floor is the operator's blackout buffer and sits ON TOP of the battery min_soc
+# (the inverter subtracts the reserve in ADDITION to min_soc_wh, so the effective
+# export floor is min_soc + reserve). ~2 kWh floor = a typical/light night.
+try:
+    _RESERVE_SAFETY_FRACTION = float(
+        os.environ.get("EOS_RESERVE_SAFETY_FRACTION", "0.5")
+    )
+except (TypeError, ValueError):
+    _RESERVE_SAFETY_FRACTION = 0.5
+try:
+    _RESERVE_MIN_SAFETY_FLOOR_WH = float(
+        os.environ.get("EOS_RESERVE_MIN_SAFETY_FLOOR_WH", "2000")
+    )
+except (TypeError, ValueError):
+    _RESERVE_MIN_SAFETY_FLOOR_WH = 2000.0
+try:
+    _RESERVE_MIN_SAFETY_CAP_WH = float(
+        os.environ.get("EOS_RESERVE_MIN_SAFETY_CAP_WH", "6000")
+    )
+except (TypeError, ValueError):
+    _RESERVE_MIN_SAFETY_CAP_WH = 6000.0
+# WATERFALL release mode (DVhub fork 2026-07-19, operator spec test, Christin):
+# when enabled AND the battery context is supplied, the reserve is NOT released
+# in every above-threshold slot. Instead the expected sellable SURPLUS above the
+# reserve (self-consumption-only trajectory from the pack's start SoC) is assumed
+# to fill the most expensive slots first — the GA sells the surplus price-best-
+# first anyway — and the reserve may only be sold in above-threshold slots LEFT
+# OVER after the surplus allocation. Default OFF -> per-slot release (prod).
+_RESERVE_WATERFALL_ENABLED = os.environ.get("EOS_RESERVE_WATERFALL", "0") not in (
+    "0",
+    "false",
+    "False",
+    "no",
+)
+
+
+def _compute_overnight_reserve(
+    load_array: np.ndarray,
+    pv_array: np.ndarray,
+    start_hour: int,
+    end_hour: int,
+    margin: float,
+    price_array: Optional[np.ndarray] = None,
+    revenue_array: Optional[np.ndarray] = None,
+    start_soc_wh: Optional[float] = None,
+    min_soc_wh: Optional[float] = None,
+    max_soc_wh: Optional[float] = None,
+    charge_eff: Optional[float] = None,
+    disch_eff: Optional[float] = None,
+    slot_cap_raw_wh: Optional[float] = None,
+    eff_ratio: Optional[float] = None,
+) -> np.ndarray:
+    """Per-slot delivered-AC energy the battery must keep for self-consumption.
+
+    reserve[h] = margin × Σ max(load[j] − pv[j], 0) for j running from h+1 up to
+    (but not including) the next slot where PV covers load. Walked backwards so
+    each evening reserves exactly the energy needed to ride to the next morning.
+
+    Price-aware release (DVhub fork 2026-06-18, gated by EOS_RESERVE_PRICE_AWARE;
+    made PER-SLOT 2026-06-29 per operator spec): when enabled AND both price_array
+    (per-slot import price, EUR/Wh) and revenue_array (per-slot feed-in revenue,
+    EUR/Wh) are supplied, each slot's reserve is RELEASED down to a hard safety
+    floor (_RESERVE_MIN_SAFETY_*_WH) whenever THAT SLOT'S OWN export price beats
+    the highest avoided night-import price by more than the RELATIVE margin
+    _RESERVE_RELEASE_MARGIN (plus an optional absolute floor
+    _RESERVE_RELEASE_SPREAD) — i.e. revenue[h] > avoided_import × (1 + margin) +
+    spread. The night reserve may therefore only be SOLD in slots that
+    individually clear the buy-back-plus-loss threshold; the surplus ABOVE the
+    reserve is sold price-best-first in any slot by the GA regardless. Using the
+    window PEAK here (pre-2026-06-29) released the whole reserve as soon as a
+    SINGLE night slot cleared the threshold, so the GA then drained the reserve
+    across sub-threshold evening slots too (selling at 30 ct, re-buying at 26.9 —
+    a sub-margin loss). reserve[h] is a per-slot EXPORT cap in inverter.py, NOT a
+    hard SoC-trajectory floor, so a per-slot release stays temporally consistent:
+    once the reserve is sold into a >threshold slot there is simply nothing above
+    the floor left to export in later sub-threshold slots — no forced recharge.
+    The relative margin tracks the resolved per-slot import price, so it is
+    correct for fixed AND dynamic tariffs. Otherwise the full energy-balance
+    reserve is kept. The release is asymmetric/conservative (a tie keeps the
+    reserve) and never drops below the safety floor. Pure function of the forecast
+    arrays — no RNG, no per-individual state — so the GA stays deterministic.
+    """
+    reserve = np.zeros_like(load_array, dtype=float)
+    if not _OVERNIGHT_RESERVE_ENABLED:
+        return reserve
+    price_aware = (
+        _RESERVE_PRICE_AWARE_ENABLED
+        and price_array is not None
+        and revenue_array is not None
+    )
+    # Waterfall needs the battery context to size the surplus pool; without it
+    # (or with the gate off) the per-slot release below stays authoritative.
+    waterfall = (
+        price_aware
+        and _RESERVE_WATERFALL_ENABLED
+        and start_soc_wh is not None
+        and min_soc_wh is not None
+        and max_soc_wh is not None
+        and charge_eff is not None
+        and disch_eff is not None
+        and slot_cap_raw_wh is not None
+        and slot_cap_raw_wh > 0
+    )
+    # (slot, export price, night-window id, full reserve, safety floor)
+    release_candidates: list[tuple[int, float, int, float, float]] = []
+    running = 0.0
+    # Exclusive upper bound of the night window the current reserve belongs to.
+    # The reserve at slot h is self-consumed over [h+1 .. night_window_end) before
+    # the next-morning PV refills the pack, so the price-aware release decision is
+    # scoped to THAT window only — comparing against prices beyond it (a later,
+    # possibly pricier night the energy never reaches) would wrongly suppress or
+    # trigger the release on a multi-day horizon (EOS runs 48h+).
+    night_window_end = end_hour
+    for h in range(end_hour - 1, start_hour - 1, -1):
+        nxt = h + 1
+        if nxt >= end_hour or pv_array[nxt] >= load_array[nxt]:
+            running = 0.0  # morning reached (or horizon end) — no reserve beyond
+            night_window_end = nxt  # a fresh night window starts above this boundary
+        else:
+            running += max(float(load_array[nxt]) - float(pv_array[nxt]), 0.0)
+        full_reserve = running * margin
+        if not price_aware or full_reserve <= 0.0:
+            reserve[h] = full_reserve
+            continue
+        # Highest avoided night-import price the reserved energy would displace,
+        # within this night window. Conservative: the most expensive slot, so the
+        # reserve only releases when the reachable export peak clearly beats it.
+        avoided_import = (
+            float(np.max(price_array[nxt:night_window_end]))
+            if nxt < night_window_end
+            else 0.0
+        )
+        # This slot's OWN export revenue (per-slot gate, 2026-06-29). The reserve
+        # may be sold ONLY in slots that individually clear the buy-back+margin
+        # threshold — NOT whenever the window's peak does. The surplus above the
+        # reserve is still sold price-best-first in any slot by the GA; this gate
+        # only stops the night reserve being nibbled in sub-threshold slots.
+        this_export = float(revenue_array[h])
+        # EOS_RESERVE_EFF_ADJUST: scale the avoided import by η_night/η_sell —
+        # the same battery-kWh displaces LESS import (partial-load inverter)
+        # than a bulk sale earns, so the fair threshold sits ~10 % BELOW the
+        # symmetric one (see _reserve_eff_ratio). None/off → factor 1.0.
+        _ratio = eff_ratio if (eff_ratio is not None and eff_ratio > 0) else 1.0
+        if this_export > avoided_import * _ratio * (1.0 + _RESERVE_RELEASE_MARGIN) + _RESERVE_RELEASE_SPREAD:
+            # Selling into the peak beats holding -> release to the LOAD-ADAPTIVE
+            # safety floor: a fraction of this night's own net-load, clamped to a
+            # hard floor (blackout buffer, on top of min_soc) and a moderate cap.
+            # Never reserve MORE than the energy balance would have asked for.
+            safety = min(
+                max(full_reserve * _RESERVE_SAFETY_FRACTION, _RESERVE_MIN_SAFETY_FLOOR_WH),
+                _RESERVE_MIN_SAFETY_CAP_WH,
+            )
+            if waterfall:
+                # Defer the decision to the waterfall pass below; keep the full
+                # reserve provisionally so a non-selected candidate stays held.
+                release_candidates.append(
+                    (h, this_export, night_window_end, full_reserve, safety)
+                )
+                reserve[h] = full_reserve
+            else:
+                reserve[h] = min(full_reserve, safety)
+        else:
+            reserve[h] = full_reserve
+    if waterfall and release_candidates:
+        # Expected pack trajectory under self-consumption only (identical
+        # semantics to the educated seed): PV surplus charges, deficit
+        # self-consumes down to min_soc. Pure function of the forecast arrays
+        # plus the pack's start SoC -> identical for every GA individual.
+        ch_eff = max(float(charge_eff), 1e-6)  # type: ignore[arg-type]
+        di_eff = max(float(disch_eff), 1e-6)  # type: ignore[arg-type]
+        cap_raw = float(slot_cap_raw_wh)  # type: ignore[arg-type]
+        min_wh = float(min_soc_wh)  # type: ignore[arg-type]
+        max_wh = float(max_soc_wh)  # type: ignore[arg-type]
+        soc_traj = np.empty(max(end_hour - start_hour, 0), dtype=float)
+        soc = float(start_soc_wh)  # type: ignore[arg-type]
+        for h in range(start_hour, end_hour):
+            soc_traj[h - start_hour] = soc
+            net = float(pv_array[h]) - float(load_array[h])
+            if net >= 0.0:
+                soc += min(net * ch_eff, max(max_wh - soc, 0.0), cap_raw * ch_eff)
+            else:
+                deliverable = min((soc - min_wh) * di_eff, cap_raw * di_eff)
+                soc -= min(-net, max(deliverable, 0.0)) / di_eff
+        sell_cap_ac = cap_raw * di_eff
+        # Per night window: the surplus above the reserve fills the most
+        # expensive above-threshold slots first (operator waterfall spec).
+        # ceil -> a partly-filled slot still counts as taken, conservative
+        # toward night autonomy. Only the LEFT-OVER candidates release.
+        windows: dict[int, list[tuple[int, float, float, float]]] = {}
+        for h, exp_price, win, full, safety in release_candidates:
+            windows.setdefault(win, []).append((h, exp_price, full, safety))
+        for cands in windows.values():
+            h0 = min(c[0] for c in cands)
+            full_ref = next(c[2] for c in cands if c[0] == h0)
+            surplus_ac = max(
+                (soc_traj[h0 - start_hour] - min_wh) * di_eff - full_ref, 0.0
+            )
+            taken = int(np.ceil(surplus_ac / sell_cap_ac)) if surplus_ac > 0.0 else 0
+            cands.sort(key=lambda c: (-c[1], c[0]))
+            for h, _exp, full, safety in cands[taken:]:
+                reserve[h] = min(full, safety)
+    return reserve
+
 
 
 class GeneticSimulation(PydanticBaseModel):
@@ -404,6 +736,43 @@ class GeneticSimulation(PydanticBaseModel):
             # Default return if no home appliance is available
             home_appliance_wh_per_hour = np.full((total_hours), 0)
 
+        # DVhub fork: overnight self-consumption reserve for battery→grid export.
+        # Indexed by absolute slot like the load/PV arrays.
+        overnight_reserve_fast = _compute_overnight_reserve(
+            load_energy_array_fast,
+            pv_prediction_wh_fast,
+            start_hour,
+            end_hour,
+            _OVERNIGHT_RESERVE_MARGIN,
+            elect_price_hourly_fast,
+            elect_revenue_per_hour_arr_fast,
+            # Battery context for the WATERFALL release mode. battery_fast is in
+            # its reset() state here (start SoC), so the trajectory is identical
+            # for every GA individual — determinism preserved.
+            start_soc_wh=float(battery_fast.soc_wh) if battery_fast else None,
+            min_soc_wh=float(battery_fast.min_soc_wh) if battery_fast else None,
+            max_soc_wh=float(battery_fast.max_soc_wh) if battery_fast else None,
+            charge_eff=float(battery_fast.charging_efficiency) if battery_fast else None,
+            disch_eff=float(battery_fast.discharging_efficiency) if battery_fast else None,
+            slot_cap_raw_wh=(
+                float(battery_fast.max_charge_power_w) * float(battery_fast.slot_duration_h)
+                if battery_fast
+                else None
+            ),
+            # EFF_ADJUST: η_night/η_sell aus der Kurve; sell-Arbeitspunkt = AC-Cap
+            # eines Bulk-Verkaufs-Slots (DC-Cap × disch_eff).
+            eff_ratio=_reserve_eff_ratio(
+                inverter_fast,
+                (
+                    float(battery_fast.max_charge_power_w)
+                    * float(battery_fast.slot_duration_h)
+                    * float(battery_fast.discharging_efficiency)
+                    if battery_fast
+                    else None
+                ),
+            ),
+        )
+
         for hour in range(start_hour, end_hour):
             hour_idx = hour - start_hour
 
@@ -461,6 +830,9 @@ class GeneticSimulation(PydanticBaseModel):
                     consumption,
                     hour,
                     allow_battery_grid_export=battery_grid_export_allowed,
+                    # DVhub-Portierung: Nacht-Reserve begrenzt NUR den
+                    # Akku->Netz-Export, nicht die Deckung der lokalen Last.
+                    export_reserve_ac_wh=float(overnight_reserve_fast[hour]),
                 )
             else:
                 hourly_feed_in_tariff = elect_revenue_per_hour_arr_fast[hour]
