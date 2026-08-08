@@ -50,8 +50,9 @@ def parse_gates(specs):
     return out
 
 
-def run_one(label, env_extra, args, out_dir):
-    out_file = out_dir / f"{label.replace(' ', '_').replace('=', '-')}.json"
+def run_one(label, env_extra, args, out_dir, seed):
+    slug = f"{label.replace(' ', '_').replace('=', '-')}_seed{seed}"
+    out_file = out_dir / f"{slug}.json"
     env = dict(os.environ)
     env.update(
         {
@@ -60,7 +61,7 @@ def run_one(label, env_extra, args, out_dir):
             "EOS_REPLAY_START_HOUR": str(args.start_hour),
             "EOS_REPLAY_NGEN": str(args.ngen),
             "EOS_REPLAY_INDIVIDUALS": str(args.individuals),
-            "EOS_REPLAY_SEED": str(args.seed),
+            "EOS_REPLAY_SEED": str(seed),
         }
     )
     env.update(env_extra)
@@ -87,40 +88,65 @@ def main():
     ap.add_argument("--start-hour", type=int, default=10)
     ap.add_argument("--ngen", type=int, default=400)
     ap.add_argument("--individuals", type=int, default=300)
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--seeds",
+        default="42",
+        help="Komma-Liste fester GA-Seeds, z.B. 42,7,1234. Mehrere Seeds sind der "
+        "einzige Weg, den Schalter-Effekt vom GA-Rauschen zu trennen — ein "
+        "Einzellauf-Delta unterhalb der Seed-Streuung ist keine Aussage.",
+    )
     ap.add_argument("--gates", action="append", default=[])
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     gates = parse_gates(args.gates) if args.gates else DEFAULT_GATES
+    seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
 
     print(f"Eingabe: {args.input}")
-    print(f"{'Schalterstellung':28}{'EUR':>10}{'Bezug Wh':>11}{'Einsp. Wh':>11}{'SoC min':>9}{'Δ EUR':>9}")
-    print("-" * 78)
+    print(f"Seeds:   {seeds}   Generationen: {args.ngen}   Individuen: {args.individuals}")
+    print()
+    print(
+        f"{'Schalterstellung':22}{'EUR Mittel':>12}{'Spanne':>9}{'Bezug Wh':>11}"
+        f"{'Einsp. Wh':>11}{'SoC min':>9}{'Δ EUR':>9}"
+    )
+    print("-" * 83)
 
-    base = None
+    num = lambda xs: [x for x in (xs or []) if isinstance(x, (int, float))]
+    fmt = lambda v, w, p=2: (f"{v:{w}.{p}f}" if isinstance(v, (int, float)) else f"{'-':>{w}}")
+
+    base_mean = None
+    spreads = []
     for label, env_extra in gates:
-        res = run_one(label, env_extra, args, out_dir)
-        if res is None:
+        runs = [r for r in (run_one(label, env_extra, args, out_dir, s) for s in seeds) if r]
+        if not runs:
             continue
-        # Schluesselnamen wie sie tests/replay/test_reserve_replay.py schreibt.
-        num = lambda xs: [x for x in (xs or []) if isinstance(x, (int, float))]
-        eur = res.get("Gesamtbilanz_Euro")
-        imp = sum(num(res.get("Netzbezug_Wh_pro_Stunde")))
-        exp = sum(num(res.get("Netzeinspeisung_Wh_pro_Stunde")))
-        soc_list = num(res.get("akku_soc_pro_stunde"))
-        soc = min(soc_list) if soc_list else None
-        if base is None:
-            base = eur
-        delta = (eur - base) if (eur is not None and base is not None) else None
-        fmt = lambda v, w, p=2: (f"{v:{w}.{p}f}" if isinstance(v, (int, float)) else f"{'-':>{w}}")
+        eurs = [r["Gesamtbilanz_Euro"] for r in runs]
+        mean = sum(eurs) / len(eurs)
+        spread = max(eurs) - min(eurs)
+        spreads.append(spread)
+        imp = sum(sum(num(r.get("Netzbezug_Wh_pro_Stunde"))) for r in runs) / len(runs)
+        exp = sum(sum(num(r.get("Netzeinspeisung_Wh_pro_Stunde"))) for r in runs) / len(runs)
+        socs = [min(num(r.get("akku_soc_pro_stunde")) or [None]) for r in runs]
+        socs = [s for s in socs if s is not None]
+        soc = min(socs) if socs else None
+        if base_mean is None:
+            base_mean = mean
+        delta = mean - base_mean
         print(
-            f"{label:28}{fmt(eur,10)}{fmt(imp,11,0)}{fmt(exp,11,0)}{fmt(soc,9,1)}"
-            f"{fmt(delta,9) if delta is not None else '        -'}"
+            f"{label:22}{fmt(mean,12)}{fmt(spread,9)}{fmt(imp,11,0)}"
+            f"{fmt(exp,11,0)}{fmt(soc,9,1)}{fmt(delta,9)}"
         )
-    print("-" * 78)
+    print("-" * 83)
     print("negativer EUR-Wert = Gewinn. Δ ist der Abstand zur ersten Zeile.")
+    if len(seeds) > 1 and spreads:
+        worst = max(spreads)
+        print(
+            f"Seed-Streuung innerhalb einer Schalterstellung: bis {worst:.2f} EUR. "
+            "Ein Δ darunter ist Rauschen, keine Wirkung."
+        )
+    else:
+        print("Nur ein Seed — das Δ kann reines GA-Rauschen sein. Mit --seeds 42,7,1234 pruefen.")
 
 
 if __name__ == "__main__":

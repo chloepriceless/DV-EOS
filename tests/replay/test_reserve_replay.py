@@ -51,9 +51,16 @@ def test_replay(config_eos: ConfigEOS):
 
     # Match the canonical optimizer test config: 48h horizon, real GA budget,
     # one EV with the standard charge-rate ladder (the input neutralizes it).
+    # Direktvermarktung: ohne diesen Schalter leitet genetic.py
+    # optimize_battery_grid_export=False ab, battery_grid_export_allowed bleibt
+    # leer und die Nacht-Reserve hat nichts zu bewachen — der A/B-Vergleich
+    # misst dann garantiert 0.00 EUR Unterschied. Per Env abschaltbar, um genau
+    # diesen Fall bewusst nachstellen zu koennen.
+    direct_marketing = os.environ.get("EOS_REPLAY_DIRECT_MARKETING", "1") not in ("0", "false", "")
     config_eos.merge_settings_from_dict(
         {
             "prediction": {"hours": 48},
+            "feedintariff": {"direct_marketing_enabled": direct_marketing},
             "optimization": {
                 "horizon_hours": 48,
                 # 15-min replay support (2026-07-19): interval=900 -> 192 slots.
@@ -106,6 +113,7 @@ def test_replay(config_eos: ConfigEOS):
         "seed": seed,
         "gate_price_aware": os.environ.get("EOS_RESERVE_PRICE_AWARE", "0"),
         "gate_overnight_reserve": os.environ.get("EOS_OVERNIGHT_RESERVE", "1"),
+        "direct_marketing_enabled": direct_marketing,
         "Gesamtbilanz_Euro": r.Gesamtbilanz_Euro,
         "Gesamteinnahmen_Euro": r.Gesamteinnahmen_Euro,
         "Gesamtkosten_Euro": r.Gesamtkosten_Euro,
