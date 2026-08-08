@@ -3,6 +3,14 @@
 NOT a CI test — skipped unless ``EOS_ROLL_CSV`` is set. Driven by
 ``scripts/replay/rolling_defer.py``.
 
+⚠️ Zwei Dinge fehlen (Stand 2026-08-08): ``scripts/replay/rolling_defer.py``
+wurde nie eingecheckt (wie ``ablate.py`` bis zum 08.08.), und der Datenanker
+``finding1-rolling-input-2026-06-18.csv`` liegt nicht im Repo. Wer diesen
+Harness braucht, baut den Treiber nach dem Muster von ``ablate.py`` neu und
+besorgt die CSV. Der Rolling-Ansatz bleibt trotzdem der interessantere: er ist
+der einzige hier, der gegen echte Ist-Werte statt gegen die eigene Prognose
+prueft — und damit der einzige, der den NUTZEN einer Reserve messen koennte.
+
 The receding-horizon bug only manifests across the rolling 15-min re-opt, which
 single-shot cannot reproduce (validated 2026-06-19). This harness replays the
 REAL per-step prod state from Völtchen's data anchor
@@ -140,6 +148,10 @@ def test_rolling_defer(config_eos: ConfigEOS):
     config_eos.merge_settings_from_dict({
         "general": {"timezone": "UTC"},  # so start_datetime maps directly to slot-of-day
         "prediction": {"hours": pred_hours},
+        # Ohne diesen Schalter leitet genetic.py optimize_battery_grid_export=False
+        # ab, battery_grid_export_allowed bleibt leer, und jeder Vergleich, der am
+        # Akku-Export haengt, misst garantiert nichts. Siehe test_reserve_replay.py.
+        "feedintariff": {"direct_marketing_enabled": True},
         "optimization": {
             "horizon_hours": pred_hours, "interval": 900,
             "genetic": {"individuals": 300, "generations": ngen,

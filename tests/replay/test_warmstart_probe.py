@@ -1,7 +1,13 @@
 """Dev probe for the Finding-1 PV store/export warm-start partition.
 
 NOT a CI test — skipped unless ``EOS_PROBE_INPUT`` is set. Driven by
-``scripts/replay/warmstart_arms.py`` (ga mode) and run directly (seed mode).
+``scripts/replay/warmstart_arms.py`` (ga mode) und direkt aufrufbar (seed mode).
+
+⚠️ ``scripts/replay/warmstart_arms.py`` EXISTIERT NICHT (Stand 2026-08-08) — der
+Treiber wurde nie eingecheckt, genau wie ``ablate.py`` es bis zum 08.08. war.
+Die Probe gehoert ausserdem zum PV-Charge-Window-Warmstart, der mit `5d2665e`
+als SHELVED markiert wurde ("EOS is not the driver"). Wer sie wiederbeleben
+will, baut den Treiber neu — ``ablate.py`` ist die Vorlage.
 
 Two modes (``EOS_PROBE_MODE``):
 
@@ -50,6 +56,10 @@ def _config(config_eos):
     config_eos.merge_settings_from_dict(
         {
             "prediction": {"hours": 48},
+            # Ohne diesen Schalter leitet genetic.py optimize_battery_grid_export=False
+            # ab, battery_grid_export_allowed bleibt leer, und die Export-Invariante
+            # dieser Probe ist unpruefbar. Siehe test_reserve_replay.py.
+            "feedintariff": {"direct_marketing_enabled": True},
             "optimization": {
                 "horizon_hours": 48,
                 "interval": interval,
