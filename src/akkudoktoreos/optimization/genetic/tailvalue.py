@@ -9,7 +9,7 @@ import numpy as np
 from pydantic import PrivateAttr
 
 from akkudoktoreos.devices.genetic.battery import Battery
-from akkudoktoreos.devices.genetic.inverter import Inverter
+from akkudoktoreos.devices.genetic.inverter import Inverter, reference_dc_to_ac_efficiency
 from akkudoktoreos.optimization.genetic.terminalvalue import (
     TailPlanSlot,
     TerminalValueCurve,
@@ -131,7 +131,7 @@ class TailValueCurve(TerminalValueCurve):
             battery=bat,
             slot_duration_h=context["slot_duration_h"],
         )
-        conversion = bat.discharging_efficiency * inv.dc_to_ac_efficiency
+        conversion = bat.discharging_efficiency * reference_dc_to_ac_efficiency(inv)
         state_wh = bat.min_soc_wh + (energy_wh / conversion if conversion > 0 else 0.0)
         state_wh = float(np.clip(state_wh, bat.min_soc_wh, bat.max_soc_wh))
         plan: list[TailPlanSlot] = []
@@ -234,7 +234,7 @@ def build_tail_value_curve(
     bat.charge_array = np.zeros(1, dtype=float)
     inv = Inverter(inverter.parameters, battery=bat, slot_duration_h=battery.slot_duration_h)
     states = np.linspace(bat.min_soc_wh, bat.max_soc_wh, grid_points)
-    usable = (states - bat.min_soc_wh) * bat.discharging_efficiency * inv.dc_to_ac_efficiency
+    usable = (states - bat.min_soc_wh) * bat.discharging_efficiency * reference_dc_to_ac_efficiency(inv)
     continuation_values = np.array([continuation.value(e) for e in usable])
     operating_values = np.zeros(len(states))
     values = continuation_values.copy()

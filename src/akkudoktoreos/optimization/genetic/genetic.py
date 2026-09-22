@@ -18,7 +18,7 @@ from akkudoktoreos.core.pydantic import PydanticBaseModel
 from akkudoktoreos.devices.devicesabc import ConsumerScheduleMode
 from akkudoktoreos.devices.genetic.battery import Battery
 from akkudoktoreos.devices.genetic.homeappliance import HomeAppliance
-from akkudoktoreos.devices.genetic.inverter import Inverter
+from akkudoktoreos.devices.genetic.inverter import Inverter, reference_dc_to_ac_efficiency
 from akkudoktoreos.optimization.genetic.geneticparams import (
     GeneticEnergyManagementParameters,
     GeneticOptimizationParameters,
@@ -936,7 +936,7 @@ class GeneticOptimization(OptimizationBase):
             self._terminal_value_reason = "terminal_value_mode is FIXED"
             return None
 
-        dc_to_ac = inverter.dc_to_ac_efficiency if inverter else 1.0
+        dc_to_ac = reference_dc_to_ac_efficiency(inverter) if inverter else 1.0
         # A full battery, expressed in the same unit as the curve: AC energy
         # that can actually leave the house.
         max_energy_wh = (
@@ -1059,7 +1059,7 @@ class GeneticOptimization(OptimizationBase):
         # Usable DC energy, converted to the AC energy that can serve a load.
         energy_wh = battery.current_energy_content()
         if self.simulation.inverter:
-            energy_wh *= self.simulation.inverter.dc_to_ac_efficiency
+            energy_wh *= reference_dc_to_ac_efficiency(self.simulation.inverter)
 
         curve = getattr(self, "_terminal_value_curve", None)
         if curve is not None and curve.energy_wh:
@@ -3039,7 +3039,7 @@ class GeneticOptimization(OptimizationBase):
                 inv.ac_to_dc_efficiency
                 * bat.charging_efficiency
                 * bat.discharging_efficiency
-                * inv.dc_to_ac_efficiency
+                * reference_dc_to_ac_efficiency(inv)
             )
 
             # Configurable penalty multiplier (default 1 = economic loss in €)
@@ -3065,7 +3065,7 @@ class GeneticOptimization(OptimizationBase):
                 free_ac_wh = (
                     max(0.0, initial_soc_wh - bat.min_soc_wh)
                     * bat.discharging_efficiency
-                    * inv.dc_to_ac_efficiency
+                    * reference_dc_to_ac_efficiency(inv)
                 )
 
                 # Prices/loads/free energy are constant within one optimization
@@ -3091,7 +3091,7 @@ class GeneticOptimization(OptimizationBase):
                     # corresponding cost per useful/exported AC Wh.
                     lcos_per_wh_dc = getattr(bat, "levelized_cost_of_storage_kwh", 0.0) / 1000.0
                     break_even_price = (
-                        charge_price / round_trip_eff + lcos_per_wh_dc / inv.dc_to_ac_efficiency
+                        charge_price / round_trip_eff + lcos_per_wh_dc / reference_dc_to_ac_efficiency(inv)
                     )
 
                     best_uncovered_price = best_prices[hour]
