@@ -1,25 +1,24 @@
 #!/usr/bin/env python
-import pickle
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import numpy as np
 
-if TYPE_CHECKING:
-    # Unpickling the table imports scipy when it is first loaded.
-    from scipy.interpolate import RegularGridInterpolator
-
 from akkudoktoreos.core.cache import cache_energy_management
 from akkudoktoreos.core.coreabc import SingletonMixin
+from akkudoktoreos.utils.gridinterpolator import (
+    LinearGridInterpolator,
+    load_grid_interpolator,
+)
 
 
 class SelfConsumptionProbabilityInterpolator:
     def __init__(self, filepath: str | Path):
         self.filepath = filepath
-        # Load the RegularGridInterpolator
-        with open(self.filepath, "rb") as file:
-            self.interpolator: RegularGridInterpolator = pickle.load(file)  # noqa: S301
+        # The table is a pickled SciPy RegularGridInterpolator; evaluate it
+        # without importing SciPy.
+        self.interpolator: LinearGridInterpolator = load_grid_interpolator(self.filepath)
 
     def _generate_points(
         self, load_1h_power: float, pv_power: float
@@ -97,7 +96,7 @@ class Genetic0LoadInterpolator(SelfConsumptionProbabilityInterpolator, Singleton
         super().__init__(filename)
 
 
-# Created on first use: loading the table imports scipy.
+# Created on first use.
 _genetic0_load_interpolator: Optional[Genetic0LoadInterpolator] = None
 _genetic0_load_interpolator_lock = threading.Lock()
 

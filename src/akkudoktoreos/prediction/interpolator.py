@@ -1,25 +1,24 @@
 #!/usr/bin/env python
-import pickle
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import numpy as np
 
-if TYPE_CHECKING:
-    # Unpickling the table imports scipy when it is first loaded.
-    from scipy.interpolate import RegularGridInterpolator
-
 from akkudoktoreos.core.cache import cache_energy_management
 from akkudoktoreos.core.coreabc import SingletonMixin
+from akkudoktoreos.utils.gridinterpolator import (
+    LinearGridInterpolator,
+    load_grid_interpolator,
+)
 
 
 class SelfConsumptionProbabilityInterpolator:
     def __init__(self, filepath: str | Path):
         self.filepath = filepath
-        # Load the RegularGridInterpolator
-        with open(self.filepath, "rb") as file:
-            self.interpolator: RegularGridInterpolator = pickle.load(file)  # noqa: S301
+        # The table is a pickled SciPy RegularGridInterpolator; evaluate it
+        # without importing SciPy.
+        self.interpolator: LinearGridInterpolator = load_grid_interpolator(self.filepath)
         self.load_power_min_w = float(self.interpolator.grid[0][0])
         self.load_power_max_w = float(self.interpolator.grid[0][-1])
         self.minute_load_levels_w = np.asarray(self.interpolator.grid[1], dtype=float)
@@ -175,7 +174,7 @@ class EOSLoadInterpolator(SelfConsumptionProbabilityInterpolator, SingletonMixin
         super().__init__(filename)
 
 
-# Created on first use: loading the table imports scipy.
+# Created on first use.
 _eos_load_interpolator: Optional[EOSLoadInterpolator] = None
 _eos_load_interpolator_lock = threading.Lock()
 

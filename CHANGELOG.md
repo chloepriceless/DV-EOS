@@ -69,8 +69,11 @@ compatibility changes and a short test procedure. These changes are not yet a ta
 - Runtime configuration changes now take priority over environment and file values for
   explicitly updated keys; command-line settings retain higher priority.
 - Lower idle memory: matplotlib (PDF reports), statsmodels (price fallback forecast), pvlib,
-  bs4/lxml, scipy (self-consumption table), the GENETIC0 optimizer and the timezone lookup
+  bs4/lxml, the GENETIC0 optimizer and the timezone lookup
   data are imported on first use instead of at server start. Results are unchanged.
+- The self-consumption probability tables are evaluated with NumPy instead of SciPy, so a
+  GENETIC run no longer loads SciPy (about 40 MB less memory). Results are bit-identical to
+  SciPy's Linux builds.
 
 ### Fixed
 
