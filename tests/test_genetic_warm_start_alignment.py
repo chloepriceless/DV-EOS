@@ -144,3 +144,29 @@ def test_parameters_accept_iso_start_solution_datetime(config_eos: ConfigEOS):
     assert compare_datetimes(
         parameters.start_solution_datetime, to_datetime("2026-09-14T07:45:00+02:00")
     ).equal
+
+
+def test_shorter_control_horizon_cuts_the_warm_start(config_eos: ConfigEOS):
+    # Previous run (07:45) planned 48 slots; the client shortened the control
+    # horizon to 44 slots (price horizon moved on). Shift first, then cut: the
+    # 08:00 run keeps the previous decisions for 08:00..18:45.
+    opt, slot0 = _optimizer(config_eos, interval=900)
+    config_eos.merge_settings_from_dict({"optimization": {"genetic": {"horizon_hours": 11}}})
+    assert opt.control_slots == 44
+    previous = _genes(0, 48)
+
+    aligned = opt._start_solution_for_run_start(previous, slot0.subtract(minutes=15))
+
+    assert aligned == _genes(1, 45)
+
+
+def test_longer_control_horizon_extends_the_warm_start(config_eos: ConfigEOS):
+    # New day-ahead prices: the horizon grows from 11 h to 24 h. The known part
+    # is kept, the new tail repeats the last decision (per block).
+    opt, slot0 = _optimizer(config_eos, interval=3600, optimize_ev=True, n_appliance_genes=1)
+    battery = _genes(0, 11)
+    ev = _genes(100, 111)
+
+    aligned = opt._start_solution_for_run_start(battery + ev + [3.0], slot0)
+
+    assert aligned == battery + [10.0] * 13 + ev + [110.0] * 13 + [3.0]
