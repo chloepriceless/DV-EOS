@@ -164,6 +164,11 @@ def _release_freed_memory() -> None:
         _LIBC.malloc_trim(0)
 
 
+# CPU share of a container/systemd limit kept free for the server process:
+# while the workers compute, it still has to answer API requests (a client
+# pushing forecasts timed out when two workers used a 2-core limit fully).
+SERVER_CPU_RESERVE = 0.25
+
 # Parallel fitness evaluation. Workers are forked once per optimization run,
 # after the run is fully prepared, so each one owns a copy of the optimizer with
 # the run's forecasts, devices and terminal-value curve. Only genomes and
@@ -181,8 +186,8 @@ def _cpu_cores() -> int:
         return max(1, os.cpu_count() or 1)
 
 
-def _cgroup_cpu_limit(cgroup_root: str = "/sys/fs/cgroup") -> Optional[int]:
-    """Return the CPU limit (cgroup v2 ``cpu.max``) in whole cores, if any.
+def _cgroup_cpu_limit(cgroup_root: str = "/sys/fs/cgroup") -> Optional[float]:
+    """Return the CPU limit (cgroup v2 ``cpu.max``) in cores, if any.
 
     Checks this process's own cgroup and every parent, so a container limit
     and a systemd ``CPUQuota=`` on a native service both count.
@@ -194,13 +199,13 @@ def _cgroup_cpu_limit(cgroup_root: str = "/sys/fs/cgroup") -> Optional[int]:
             )
     except OSError:
         path = "/"
-    limits: list[int] = []
+    limits: list[float] = []
     while True:
         try:
             with open(os.path.join(cgroup_root, path.lstrip("/"), "cpu.max")) as cpu_max:
                 quota, period = cpu_max.read().split()[:2]
             if quota != "max":
-                limits.append(max(1, math.ceil(int(quota) / int(period))))
+                limits.append(int(quota) / int(period))
         except (OSError, ValueError, ZeroDivisionError):
             pass
         if path in ("", "/"):
@@ -209,12 +214,13 @@ def _cgroup_cpu_limit(cgroup_root: str = "/sys/fs/cgroup") -> Optional[int]:
     return min(limits) if limits else None
 
 
-def auto_evaluation_workers(cores: Optional[int] = None, cpu_limit: Optional[int] = None) -> int:
+def auto_evaluation_workers(cores: Optional[int] = None, cpu_limit: Optional[float] = None) -> int:
     """Number of evaluation processes when ``workers`` is not configured.
 
     One core always stays free for the rest of the system, and at most
     ``MAX_EVALUATION_WORKERS`` are used: 1-2 cores -> 1, 3 or more -> 2.
-    A container CPU limit caps the result further.
+    A CPU limit caps the result further and keeps ``SERVER_CPU_RESERVE`` of
+    it for the server process (limit 2 -> 1 worker, 2.5 -> 2).
     """
     if cores is None:
         cores = _cpu_cores()
@@ -222,14 +228,38 @@ def auto_evaluation_workers(cores: Optional[int] = None, cpu_limit: Optional[int
         cpu_limit = _cgroup_cpu_limit()
     workers = min(MAX_EVALUATION_WORKERS, max(1, cores - 1))
     if cpu_limit is not None:
-        workers = min(workers, max(1, cpu_limit))
+        workers = min(workers, max(1, math.floor(cpu_limit - SERVER_CPU_RESERVE)))
     return workers
 
 
-def _evaluation_worker_init() -> None:
+def worker_cpu_set(workers: int, allowed: Optional[set[int]] = None) -> Optional[set[int]]:
+    """CPU cores the evaluation workers are pinned to, or None for no pinning.
+
+    The workers get the last ``workers`` cores this process may use; the
+    server process itself stays unpinned. It therefore always finds a core
+    that is not busy with the optimization and keeps answering requests, and
+    the optimization never spreads beyond ``workers`` cores (no CPU quota
+    needed). Without a spare core there is nothing to gain: no pinning.
+    """
+    if allowed is None:
+        try:
+            allowed = set(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            return None
+    if workers < 1 or len(allowed) <= workers:
+        return None
+    return set(sorted(allowed)[-workers:])
+
+
+def _evaluation_worker_init(cpus: Optional[set[int]] = None) -> None:
     """Evaluate without the run cache in a worker; the parent owns the cache."""
     if _WORKER_OPTIMIZER is not None:
         _WORKER_OPTIMIZER._fitness_cache_enabled = False
+    if cpus:
+        try:
+            os.sched_setaffinity(0, cpus)
+        except (AttributeError, OSError):
+            pass
 
 
 def _evaluation_worker(genome: list[int]) -> tuple[list[int], tuple[float], Any]:
@@ -1698,51 +1728,68 @@ class GeneticOptimization(OptimizationBase):
         Genomes are run-relative, so a solution returned one slot ago describes
         every battery and EV decision one slot too late. Reused unchanged, a
         search that keeps the seed postpones each planned action by one slot per
-        run. The battery and EV blocks therefore drop the elapsed slots and
-        repeat their last gene to refill the horizon.
+        run. The battery and EV blocks therefore drop the elapsed slots.
+
+        A client may also move the control horizon between runs (e.g. to the
+        end of the known price horizon, which shrinks every hour). The blocks
+        are then cut to the new length or extended by repeating their last
+        gene, instead of discarding the warm start for its length.
 
         Appliance genes index into per-run lists of allowed start slots that
         cannot be rebuilt for the earlier run; they are kept and validated
         against the current layout as before.
         """
-        if (
-            start_solution is None
-            or start_solution_datetime is None
-            or self._slot0_datetime is None
-        ):
-            return start_solution
+        if start_solution is None:
+            return None
         start_solution = self._start_solution_for_slot_grid(start_solution)
         blocks = 2 if self.optimize_ev else 1
-        if len(start_solution) != self.control_end_slot * blocks + self.appliance_layout.n_genes:
+        n_appliance_genes = self.appliance_layout.n_genes
+        block_genes = len(start_solution) - n_appliance_genes
+        if block_genes <= 0 or block_genes % blocks:
             # optimize() rejects the length and logs why.
             return start_solution
+        previous_slots = block_genes // blocks
+        current_slots = self.control_end_slot
 
-        elapsed_s = (self._slot0_datetime - start_solution_datetime).total_seconds()
-        if elapsed_s < 0:
-            logger.warning(
-                "Ignoring start_solution from {}: it starts after this run ({}).",
-                start_solution_datetime,
-                self._slot0_datetime,
-            )
-            return None
-        elapsed_slots = int(elapsed_s // (self.slot_duration_h * 3600))
-        if elapsed_slots == 0:
+        elapsed_slots = 0
+        if start_solution_datetime is not None and self._slot0_datetime is not None:
+            elapsed_s = (self._slot0_datetime - start_solution_datetime).total_seconds()
+            if elapsed_s < 0:
+                logger.warning(
+                    "Ignoring start_solution from {}: it starts after this run ({}).",
+                    start_solution_datetime,
+                    self._slot0_datetime,
+                )
+                return None
+            elapsed_slots = int(elapsed_s // (self.slot_duration_h * 3600))
+            if elapsed_slots >= previous_slots:
+                logger.info(
+                    "Ignoring start_solution from {}: all {} control slots have elapsed.",
+                    start_solution_datetime,
+                    previous_slots,
+                )
+                return None
+        if elapsed_slots == 0 and previous_slots == current_slots:
             return start_solution
-        if elapsed_slots >= self.control_slots:
-            logger.info(
-                "Ignoring start_solution from {}: all {} control slots have elapsed.",
-                start_solution_datetime,
-                self.control_slots,
-            )
-            return None
 
-        aligned = list(start_solution)
+        aligned: list[float] = []
         for block in range(blocks):
-            begin = self._control_start_slot() + block * self.control_end_slot
-            end = begin + self.control_slots
-            genes = aligned[begin:end]
-            aligned[begin:end] = genes[elapsed_slots:] + [genes[-1]] * elapsed_slots
-        logger.debug("Shifted start_solution by {} elapsed slots.", elapsed_slots)
+            begin = block * previous_slots
+            genes = list(start_solution[begin : begin + previous_slots])[elapsed_slots:]
+            if len(genes) >= current_slots:
+                genes = genes[:current_slots]
+            else:
+                genes.extend([genes[-1]] * (current_slots - len(genes)))
+            aligned.extend(genes)
+        aligned.extend(start_solution[blocks * previous_slots :])
+        if previous_slots != current_slots:
+            logger.info(
+                "Resized start_solution from {} to {} control slots (control horizon changed).",
+                previous_slots,
+                current_slots,
+            )
+        if elapsed_slots:
+            logger.debug("Shifted start_solution by {} elapsed slots.", elapsed_slots)
         return aligned
 
     def decode_charge_discharge(
@@ -2638,16 +2685,30 @@ class GeneticOptimization(OptimizationBase):
         except ValueError:
             logger.warning("Parallel fitness evaluation needs fork(); evaluating serially.")
             return
+        cpus = worker_cpu_set(self._evaluation_workers) if self._pin_workers() else None
         _WORKER_OPTIMIZER = self
         try:
             self._evaluation_pool = context.Pool(
-                self._evaluation_workers, initializer=_evaluation_worker_init
+                self._evaluation_workers,
+                initializer=_evaluation_worker_init,
+                initargs=(cpus,),
             )
         except Exception as exc:
             _WORKER_OPTIMIZER = None
             logger.warning("Could not start evaluation workers ({}); evaluating serially.", exc)
             return
-        logger.info("Genetic evaluation: {} worker processes.", self._evaluation_workers)
+        logger.info(
+            "Genetic evaluation: {} worker processes{}.",
+            self._evaluation_workers,
+            f" on CPU cores {sorted(cpus)}" if cpus else "",
+        )
+
+    def _pin_workers(self) -> bool:
+        """Whether evaluation workers are pinned to fixed CPU cores."""
+        try:
+            return bool(self._genetic_cfg.pin_workers)
+        except Exception:
+            return True
 
     def _stop_evaluation_pool(self) -> None:
         """Stop the evaluation workers of this run."""
