@@ -130,6 +130,37 @@ async def test_missing_stale_future_or_invalid_soc_never_becomes_zero(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("gap", [None, np.nan])
+async def test_newest_record_without_soc_falls_back_to_the_previous_value(configured_request, gap):
+    # A client writes several keys for one timestamp, one request each. A run
+    # that starts between two of those writes sees the newest record without
+    # this device's SoC - it must use the value of the minute before.
+    _, ems, measurement, data = configured_request
+    data["soc"] = {}
+    now = ems.observation_datetime
+    measurement.key_to_lists.return_value = (
+        [now.subtract(seconds=126), now.subtract(seconds=66), now.subtract(seconds=6)],
+        [0.71, 0.74, gap],
+    )
+    parameters = await ConfigOptimizationRequest.model_validate(data).resolve()
+    assert parameters.pv_battery is not None
+    assert parameters.pv_battery.initial_soc_percentage == 74
+
+
+@pytest.mark.asyncio
+async def test_gap_does_not_make_a_stale_soc_acceptable(configured_request):
+    _, ems, measurement, data = configured_request
+    data["soc"] = {}
+    now = ems.observation_datetime
+    measurement.key_to_lists.return_value = (
+        [now.subtract(seconds=400), now.subtract(seconds=6)],
+        [0.74, None],
+    )
+    with pytest.raises(ValueError, match="Fresh SoC missing"):
+        await ConfigOptimizationRequest.model_validate(data).resolve()
+
+
+@pytest.mark.asyncio
 async def test_soc_freshness_uses_actual_run_time_inside_quarter_hour(configured_request):
     _, ems, measurement, data = configured_request
     data["soc"] = {}

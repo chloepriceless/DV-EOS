@@ -99,17 +99,22 @@ class ConfigOptimizationRequest(
                     end_datetime=observation_time.add(seconds=1),
                     dropna=False,
                 )
+                # The newest record may not carry this key yet: a client that
+                # writes several keys for one timestamp creates the record with
+                # its first write (e.g. the battery SoC) and fills the others a
+                # moment later. A run starting in between must fall back to the
+                # newest record that has a value, not fail on the gap.
                 samples = [
                     (date, value)
                     for date, value in zip(dates, values)
                     if date.timestamp() <= observation_time.timestamp()
+                    and value is not None
+                    and math.isfinite(value)
                 ]
                 date, value = max(samples, key=lambda sample: sample[0].timestamp())
                 if (
                     observation_time.timestamp() - date.timestamp()
                     > settings.measurement_max_age_seconds
-                    or value is None
-                    or not math.isfinite(value)
                     or not 0 <= value <= 1
                 ):
                     raise ValueError("Invalid or stale SoC factor")
@@ -149,20 +154,18 @@ class ConfigOptimizationRequest(
                 )
             except KeyError:
                 continue
+            # As for the SoC: skip records that do not carry this key (yet).
             samples = [
                 (date, count)
                 for date, count in zip(dates, counts)
                 if date.timestamp() <= observation_time.timestamp()
+                and count is not None
+                and math.isfinite(count)
             ]
             if not samples:
                 continue
             count = max(samples, key=lambda item: item[0].timestamp())[1]
-            if (
-                count is None
-                or not math.isfinite(count)
-                or int(count) != count
-                or not 0 <= count <= appliance.num_cycles
-            ):
+            if int(count) != count or not 0 <= count <= appliance.num_cycles:
                 raise ValueError(f"Invalid completed cycle count for {device.device_id}.")
             appliance.completed_cycles = int(count)
 
